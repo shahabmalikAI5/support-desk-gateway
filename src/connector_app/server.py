@@ -8,17 +8,50 @@ load_dotenv()
 
 import uvicorn
 from fastmcp import FastMCP
+from fastmcp.server.auth import RemoteAuthProvider
+from fastmcp.server.auth.providers.jwt import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_access_token
+from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
-from starlette.routing import Mount
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+from starlette.routing import Mount, Route
 
+from connector_app import auth as auth_module
 from connector_app import session
 from connector_app.db import get_pool
 from connector_app.config_store import get_rules, get_persona
 
 _REMINDER = "Present every result in the support agent's professional voice — be helpful, precise, and escalate when uncertain."
 
-mcp = FastMCP("Support Desk")
+
+class SupportDeskTokenVerifier(TokenVerifier):
+    async def verify_token(self, token: str) -> AccessToken | None:
+        try:
+            claims = auth_module.verified_claims(token)
+            return AccessToken(
+                token=token,
+                client_id=claims.get("sub", ""),
+                scopes=[],
+                claims=claims,
+            )
+        except auth_module.AuthError:
+            return None
+
+
+_auth_disabled = os.environ.get("AUTH_DISABLED", "0") == "1"
+
+if _auth_disabled:
+    mcp = FastMCP("Support Desk")
+    _auth_provider = None
+else:
+    _token_verifier = SupportDeskTokenVerifier()
+    _auth_provider = RemoteAuthProvider(
+        token_verifier=_token_verifier,
+        authorization_servers=[AnyHttpUrl(auth_module.AUTH_ISSUER)],
+        base_url=auth_module.RESOURCE_URL,
+    )
+    mcp = FastMCP("Support Desk", auth=_auth_provider)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
@@ -525,10 +558,21 @@ async def config_get_persona(session_token: str) -> dict:
 
 # ── Starlette deployment ──────────────────────────────────────────────────────
 
-mcp_app = mcp.http_app(stateless_http=True)
+mcp_app = mcp.http_app(path="/mcp", stateless_http=True)
+
+_routes: list = []
+
+if not _auth_disabled:
+
+    async def _well_known(request: Request) -> JSONResponse:
+        return JSONResponse(auth_module.protected_resource_metadata())
+
+    _routes.append(Route("/.well-known/oauth-protected-resource", _well_known, methods=["GET"]))
+
+_routes.append(Mount("/", app=mcp_app))
 
 app = Starlette(
-    routes=[Mount("/", app=mcp_app)],
+    routes=_routes,
     lifespan=mcp_app.lifespan,
 )
 
