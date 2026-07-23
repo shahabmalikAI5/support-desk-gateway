@@ -1,4 +1,5 @@
 import os
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
@@ -9,7 +10,8 @@ import uvicorn
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.descope import DescopeProvider
 from starlette.applications import Starlette
-from starlette.routing import Mount
+from starlette.responses import FileResponse
+from starlette.routing import Mount, Route
 
 from connector_app import auth as auth_module
 from connector_app import session
@@ -477,6 +479,35 @@ async def catalog_list_all(entity_type: str, session_token: str) -> dict:
     return await catalog_tools.list_all(pool, sub, role, entity_type, _REMINDER)
 
 
+# ── Admin dashboard route ─────────────────────────────────────────────────────
+
+async def _admin_page(request):
+    return FileResponse("admin/index.html")
+
+
+# ── Background sync ──────────────────────────────────────────────────────────
+
+_sync_task = None
+
+
+@asynccontextmanager
+async def _combined_lifespan(app_):
+    global _sync_task
+    async with mcp_app.lifespan(app_):
+        from connector_app import sync
+        try:
+            pool = await get_pool()
+            _sync_task = sync.start_background_sync(pool)
+        except Exception:
+            pass
+        try:
+            yield
+        finally:
+            if _sync_task is not None:
+                _sync_task.cancel()
+                _sync_task = None
+
+
 # ── Starlette deployment ──────────────────────────────────────────────────────
 
 mcp_app = mcp.http_app(path="/mcp", stateless_http=True)
@@ -486,11 +517,12 @@ _routes: list = []
 if not _auth_disabled and _auth_provider is not None:
     _routes.extend(_auth_provider.get_well_known_routes(mcp_path="/mcp"))
 
+_routes.append(Route("/admin", endpoint=_admin_page))
 _routes.append(Mount("/", app=mcp_app))
 
 app = Starlette(
     routes=_routes,
-    lifespan=mcp_app.lifespan,
+    lifespan=_combined_lifespan,
 )
 
 if __name__ == "__main__":

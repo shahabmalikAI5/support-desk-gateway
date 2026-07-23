@@ -1,0 +1,171 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Support Desk — Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#f5f7fa;color:#1a1a2e;padding:20px}
+header{max-width:960px;margin:0 auto 24px;border-bottom:2px solid #e2e8f0;padding-bottom:12px}
+header h1{font-size:1.5rem;color:#2563eb}
+header p{font-size:.85rem;color:#64748b}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;max-width:960px;margin:0 auto}
+.card{background:#fff;border-radius:8px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,.1)}
+.card.full{grid-column:1/-1}
+.card h2{font-size:1rem;margin-bottom:12px;color:#334155}
+label{display:block;font-size:.8rem;font-weight:600;color:#475569;margin-bottom:4px}
+textarea{width:100%;min-height:120px;padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-family:monospace;font-size:.85rem;resize:vertical}
+input[type=text]{width:100%;padding:8px;border:1px solid #cbd5e1;border-radius:4px;font-size:.85rem}
+button{padding:8px 16px;border:none;border-radius:4px;cursor:pointer;font-size:.85rem;font-weight:600}
+.btn-primary{background:#2563eb;color:#fff}
+.btn-primary:hover{background:#1d4ed8}
+.btn-danger{background:#ef4444;color:#fff}
+.btn-secondary{background:#e2e8f0;color:#475569}
+.mt-8{margin-top:8px}
+.mt-12{margin-top:12px}
+.mb-8{margin-bottom:8px}
+.gap-8{display:flex;gap:8px}
+table{width:100%;border-collapse:collapse;font-size:.85rem}
+th,td{text-align:left;padding:8px 12px;border-bottom:1px solid #e2e8f0}
+th{background:#f8fafc;font-weight:600;color:#475569}
+.status-badge{display:inline-block;padding:2px 8px;border-radius:10px;font-size:.75rem;font-weight:600}
+.status-open{background:#dbeafe;color:#1d4ed8}
+.status-in_progress{background:#fef3c7;color:#b45309}
+.status-resolved{background:#d1fae5;color:#065f46}
+.status-closed{background:#e2e8f0;color:#475569}
+#toast{position:fixed;bottom:24px;right:24px;padding:12px 20px;border-radius:8px;font-size:.85rem;display:none;z-index:100}
+#toast.success{background:#065f46;color:#fff;display:block}
+#toast.error{background:#991b1b;color:#fff;display:block}
+.loading{opacity:.5;pointer-events:none}
+@media(max-width:700px){.grid{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+<header>
+<h1>Support Desk — Admin Dashboard</h1>
+<p>Edit rules, persona, and catalog content. Changes are immediate on next user session.</p>
+</header>
+<div class="grid" id="app">
+<div class="card full">
+<h2>Session Token</h2>
+<input type="text" id="sessionToken" placeholder="Paste session token from begin_session...">
+</div>
+<div class="card">
+<h2>Behavioral Rules</h2>
+<textarea id="rulesEditor" placeholder="Loading current rules..."></textarea>
+<button class="btn-primary mt-8" onclick="saveRules()">Save Rules</button>
+<button class="btn-secondary mt-8" style="margin-left:8px" onclick="restoreRules()">Restore Version</button>
+</div>
+<div class="card">
+<h2>Assistant Persona</h2>
+<textarea id="personaEditor" placeholder="Loading current persona..."></textarea>
+<button class="btn-primary mt-8" onclick="savePersona()">Save Persona</button>
+<button class="btn-secondary mt-8" style="margin-left:8px" onclick="restorePersona()">Restore Version</button>
+</div>
+<div class="card full">
+<h2>Catalog Items</h2>
+<div class="gap-8 mb-8">
+<select id="catalogType" style="padding:8px;border:1px solid #cbd5e1;border-radius:4px">
+<option value="policy">Policies</option>
+<option value="order">Orders</option>
+</select>
+<button class="btn-primary" onclick="loadCatalog()">Refresh</button>
+</div>
+<table id="catalogTable"><tr><td colspan="3">Click "Refresh" to load catalog items.</td></tr></table>
+</div>
+</div>
+<div id="toast"></div>
+<script>
+const GATEWAY = window.location.origin;
+let sessionToken = '';
+
+document.getElementById('sessionToken').addEventListener('input', e => {
+  sessionToken = e.target.value.trim();
+});
+
+async function mcpCall(tool, args) {
+  const resp = await fetch(GATEWAY + '/mcp', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({jsonrpc:'2.0', id:1, method:'tools/call', params:{name:tool, arguments:args}})
+  });
+  return await resp.json();
+}
+
+function showToast(msg, type) {
+  const el = document.getElementById('toast');
+  el.textContent = msg; el.className = type;
+  setTimeout(() => { el.className = ''; }, 4000);
+}
+
+async function loadRules() {
+  if (!sessionToken) return;
+  const r = await mcpCall('config_get_rules', {session_token: sessionToken});
+  const rules = r?.result?.rules || r?.error?.message || 'error loading';
+  document.getElementById('rulesEditor').value = typeof rules === 'string' ? rules : JSON.stringify(rules);
+}
+async function loadPersona() {
+  if (!sessionToken) return;
+  const r = await mcpCall('config_get_persona', {session_token: sessionToken});
+  const p = r?.result?.persona || r?.error?.message || 'error loading';
+  document.getElementById('personaEditor').value = typeof p === 'string' ? p : JSON.stringify(p);
+}
+async function loadCatalog() {
+  if (!sessionToken) return;
+  const type = document.getElementById('catalogType').value;
+  const r = await mcpCall('catalog_list_all', {entity_type: type, session_token: sessionToken});
+  const items = r?.result?.items || [];
+  const table = document.getElementById('catalogTable');
+  if (items.length === 0) {
+    table.innerHTML = '<tr><td colspan="3">No items found.</td></tr>';
+    return;
+  }
+  table.innerHTML = '<tr><th>ID</th><th>Content Preview</th><th></th></tr>' +
+    items.map(i => {
+      const c = i.content || {};
+      const preview = c.title || c.body || c.customer || '';
+      return `<tr><td>${i.id}</td><td>${String(preview).slice(0,80)}</td><td><button class="btn-danger" onclick="deleteItem('${i.id}','${type}')">Delete</button></td></tr>`;
+    }).join('');
+}
+async function saveRules() {
+  document.querySelector('.card:has(#rulesEditor)').classList.add('loading');
+  const r = await mcpCall('config_set_rules', {rules: document.getElementById('rulesEditor').value, session_token: sessionToken});
+  document.querySelector('.card:has(#rulesEditor)').classList.remove('loading');
+  showToast(r?.result?.status === 'saved' ? 'Rules saved.' : 'Error: ' + (r?.error?.message || 'unknown'), r?.result?.status === 'saved' ? 'success' : 'error');
+}
+async function savePersona() {
+  document.querySelector('.card:has(#personaEditor)').classList.add('loading');
+  const r = await mcpCall('config_set_persona', {persona: document.getElementById('personaEditor').value, session_token: sessionToken});
+  document.querySelector('.card:has(#personaEditor)').classList.remove('loading');
+  showToast(r?.result?.status === 'saved' ? 'Persona saved.' : 'Error: ' + (r?.error?.message || 'unknown'), r?.result?.status === 'saved' ? 'success' : 'error');
+}
+function restoreRules() {
+  const idx = prompt('Version index to restore (see config_history table):');
+  if (idx === null) return;
+  mcpCall('config_restore_version', {key:'rules', version_index:parseInt(idx), session_token: sessionToken}).then(r => {
+    showToast(r?.result?.status === 'restored' ? 'Restored.' : 'Error: ' + (r?.error?.message || 'not found'), r?.result?.status === 'restored' ? 'success' : 'error');
+    loadRules();
+  });
+}
+function restorePersona() {
+  const idx = prompt('Version index to restore (see config_history table):');
+  if (idx === null) return;
+  mcpCall('config_restore_version', {key:'persona', version_index:parseInt(idx), session_token: sessionToken}).then(r => {
+    showToast(r?.result?.status === 'restored' ? 'Restored.' : 'Error: ' + (r?.error?.message || 'not found'), r?.result?.status === 'restored' ? 'success' : 'error');
+    loadPersona();
+  });
+}
+function deleteItem(id, type) {
+  if (!confirm(`Delete ${type} "${id}"?`)) return;
+  mcpCall('catalog_delete_item', {item_id: id, entity_type: type, session_token: sessionToken}).then(r => {
+    showToast(r?.result?.status === 'deleted' ? 'Deleted.' : 'Error', r?.result?.status === 'deleted' ? 'success' : 'error');
+    loadCatalog();
+  });
+}
+document.addEventListener('DOMContentLoaded', () => {
+  document.getElementById('sessionToken').addEventListener('blur', () => { loadRules(); loadPersona(); });
+});
+</script>
+</body>
+</html>

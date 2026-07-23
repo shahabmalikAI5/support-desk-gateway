@@ -11,10 +11,11 @@ requires-python = ">=3.14"
 # Floors, not pins. When Context7 / live docs disagree with anything here, the live docs win.
 dependencies = [
     "python-jose[cryptography]>=3.3",  # JWT validation in auth.py / session.py (pulls cryptography)
-    "httpx>=0.27",                     # fetch the authorization server's JWKS
+    "httpx>=0.27",                     # fetch the authorization server's JWKS, SendGrid, Freshdesk
     "fastmcp>=3.4.4",
     "psycopg[binary,pool]>=3.3.4",
     "python-dotenv>=1.2.2",
+    "boto3>=1.34",                     # S3-compatible R2 presigned URLs for attachments
 ]
 
 [project.optional-dependencies]
