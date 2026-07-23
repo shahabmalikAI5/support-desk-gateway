@@ -217,13 +217,13 @@ async def domain_assign_ticket(ticket_id: str, agent: str, session_token: str) -
 
 
 @mcp.tool
-async def domain_reassign_ticket(ticket_id: str, new_assignee: str, session_token: str) -> dict:
-    """Reassign an already-assigned ticket to a different agent."""
+async def domain_reassign_ticket(ticket_id: str, new_agent: str, session_token: str, reason: str | None = None) -> dict:
+    """Reassign an already-assigned ticket to a different agent. Optionally provide a reason."""
     sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
     pool = await get_pool()
-    return await domain_tools.reassign_ticket(pool, sub, role, ticket_id, new_assignee, _REMINDER)
+    return await domain_tools.reassign_ticket(pool, sub, role, ticket_id, new_agent, _REMINDER, reason=reason)
 
 
 @mcp.tool
@@ -231,15 +231,17 @@ async def domain_update_ticket(ticket_id: str, session_token: str,
                                 status: str | None = None,
                                 priority: str | None = None,
                                 body: str | None = None,
-                                category: str | None = None) -> dict:
-    """Update a ticket's status, priority, body, or category. Validates status transitions."""
+                                category: str | None = None,
+                                reply_body: str | None = None) -> dict:
+    """Update a ticket's status, priority, body, category, or send a reply. Validates status transitions."""
     sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
     pool = await get_pool()
     return await domain_tools.update_ticket(pool, sub, role, ticket_id, _REMINDER,
                                              status=status, priority=priority,
-                                             body=body, category=category)
+                                             body=body, category=category,
+                                             reply_body=reply_body)
 
 
 @mcp.tool

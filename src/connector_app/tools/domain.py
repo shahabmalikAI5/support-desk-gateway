@@ -355,7 +355,7 @@ async def assign_ticket(pool, sub: str, role: str, ticket_id: str, agent: str, r
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT status, assigned_to FROM tickets WHERE id = %s FOR UPDATE",
+                    "SELECT status, assigned_to, created_by FROM tickets WHERE id = %s FOR UPDATE",
                     (ticket_id,),
                 )
                 row = await cur.fetchone()
@@ -363,6 +363,7 @@ async def assign_ticket(pool, sub: str, role: str, ticket_id: str, agent: str, r
                     return {"message": "not found", "_reminder": reminder}
                 current_status = row[0]
                 current_assigned = row[1]
+                ticket_creator = row[2]
                 if current_status in ("resolved", "closed"):
                     return {"error": "ticket is already resolved — cannot reassign", "_reminder": reminder}
                 if current_assigned and current_assigned.strip().lower() == agent_normalized.lower():
@@ -384,6 +385,9 @@ async def assign_ticket(pool, sub: str, role: str, ticket_id: str, agent: str, r
                     (ticket_id, sub, role or "staff",
                      f"Ticket assigned to {agent_normalized} (status: {current_status} → {new_status})"),
                 )
+        if ticket_creator:
+            from connector_app.notifications import dispatch as _dispatch
+            await _dispatch(ticket_id, "agent_assigned", ticket_creator, pool)
         await log_audit(pool, sub, "domain_assign_ticket", f"ticket={ticket_id},agent={agent_normalized}", "assigned")
         return {
             "ticket_id": ticket_id, "assigned_to": agent_normalized,
@@ -394,46 +398,73 @@ async def assign_ticket(pool, sub: str, role: str, ticket_id: str, agent: str, r
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
 
-async def reassign_ticket(pool, sub: str, role: str, ticket_id: str, new_assignee: str, reminder: str) -> dict:
+async def reassign_ticket(pool, sub: str, role: str, ticket_id: str, new_agent: str, reminder: str, *,
+                           reason: str | None = None) -> dict:
     allowed_roles = ["admin", "staff"]
     if role is None or role not in allowed_roles:
         return {"message": "not found", "_reminder": reminder}
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT status FROM tickets WHERE id = %s", (ticket_id,))
+                await cur.execute(
+                    "SELECT status, assigned_to FROM tickets WHERE id = %s FOR UPDATE",
+                    (ticket_id,),
+                )
                 row = await cur.fetchone()
                 if row is None:
                     return {"message": "not found", "_reminder": reminder}
+                previous_agent = row[1]
                 now_ts = _now_iso()
                 await cur.execute(
                     "UPDATE tickets SET assigned_to = %s, assigned_at = %s, updated_at = %s, last_activity_at = %s "
                     "WHERE id = %s",
-                    (new_assignee, now_ts, now_ts, now_ts, ticket_id),
+                    (new_agent.strip(), now_ts, now_ts, now_ts, ticket_id),
                 )
-        await log_audit(pool, sub, "domain_reassign_ticket", f"ticket={ticket_id},assignee={new_assignee}", "reassigned")
-        return {"status": "reassigned", "assigned_to": new_assignee, "_reminder": reminder}
+                reason_text = f" ({reason})" if reason else ""
+                await cur.execute(
+                    "INSERT INTO ticket_notes (ticket_id, author_sub, author_role, body, note_type) "
+                    "VALUES (%s, %s, %s, %s, 'system_event')",
+                    (ticket_id, sub, role or "staff",
+                     f"Reassigned from {previous_agent or 'unassigned'} to {new_agent.strip()}{reason_text}"),
+                )
+        await log_audit(pool, sub, "domain_reassign_ticket",
+                        f"ticket={ticket_id},agent={new_agent}", "reassigned")
+        return {
+            "ticket_id": ticket_id, "assigned_to": new_agent.strip(),
+            "previous_agent": previous_agent, "reason": reason,
+            "reassigned_at": now_ts, "_reminder": reminder,
+        }
     except Exception:
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
 
 async def update_ticket(pool, sub: str, role: str, ticket_id: str, reminder: str, *,
                         status: str | None = None, priority: str | None = None,
-                        body: str | None = None, category: str | None = None) -> dict:
+                        body: str | None = None, category: str | None = None,
+                        reply_body: str | None = None) -> dict:
     allowed_roles = ["admin", "staff"]
     if role is None or role not in allowed_roles:
         return {"message": "not found", "_reminder": reminder}
+    valid_categories = {"billing", "returns", "technical", "account", "shipping", "other"}
+    if category is not None and category not in valid_categories:
+        return {"error": "category must be one of: billing, returns, technical, account, shipping, other", "_reminder": reminder}
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT status FROM tickets WHERE id = %s", (ticket_id,))
+                await cur.execute(
+                    "SELECT status, created_by FROM tickets WHERE id = %s FOR UPDATE",
+                    (ticket_id,),
+                )
                 row = await cur.fetchone()
                 if row is None:
                     return {"message": "not found", "_reminder": reminder}
                 current_status = row[0]
+                ticket_creator = row[1]
 
                 if status is not None and not validate_transition(current_status, status):
-                    return {"error": f"Invalid transition from {current_status} to {status}", "_reminder": reminder}
+                    return {"error": f"cannot transition from {current_status} to {status}", "_reminder": reminder}
+
+                is_reopen = (status == "open" and current_status == "resolved")
 
                 sets: list[str] = []
                 params: list = []
@@ -446,6 +477,10 @@ async def update_ticket(pool, sub: str, role: str, ticket_id: str, reminder: str
                     if status == "closed":
                         sets.append("closed_at = %s")
                         params.append(_now_iso())
+                    if is_reopen:
+                        sets.append("resolved_at = NULL")
+                        sets.append("csat_score = NULL")
+                        sets.append("freshdesk_synced_at = NULL")
                 if priority is not None:
                     if priority not in ("low", "medium", "high", "critical"):
                         return {"error": "priority must be one of: low, medium, high, critical", "_reminder": reminder}
@@ -458,22 +493,40 @@ async def update_ticket(pool, sub: str, role: str, ticket_id: str, reminder: str
                     sets.append("category = %s")
                     params.append(category)
 
-                if not sets:
+                if not sets and reply_body is None:
                     return {"error": "no fields to update", "_reminder": reminder}
 
-                sets.append("updated_at = %s")
-                params.append(_now_iso())
-                sets.append("last_activity_at = %s")
-                params.append(_now_iso())
-                params.append(ticket_id)
+                if sets:
+                    sets.append("updated_at = %s")
+                    params.append(_now_iso())
+                    sets.append("last_activity_at = %s")
+                    params.append(_now_iso())
+                    params.append(ticket_id)
 
-                await cur.execute(
-                    f"UPDATE tickets SET {', '.join(sets)} WHERE id = %s",
-                    params,
-                )
+                    await cur.execute(
+                        f"UPDATE tickets SET {', '.join(sets)} WHERE id = %s",
+                        params,
+                    )
+
+                reply_sent = False
+                if reply_body:
+                    await cur.execute(
+                        "INSERT INTO ticket_notes (ticket_id, author_sub, author_role, body, note_type) "
+                        "VALUES (%s, %s, %s, %s, 'reply')",
+                        (ticket_id, sub, role or "staff", reply_body),
+                    )
+                    reply_sent = True
+                    if ticket_creator:
+                        from connector_app.notifications import dispatch
+                        event_type = "status_changed" if status else "agent_assigned"
+                        await dispatch(ticket_id, event_type, ticket_creator, pool)
 
         await log_audit(pool, sub, "domain_update_ticket", f"ticket={ticket_id},fields={sets}", "updated")
-        return {"status": "updated", "ticket_id": ticket_id, "_reminder": reminder}
+        result = {"ticket_id": ticket_id, "status": status or current_status, "updated_at": _now_iso()}
+        if reply_body:
+            result["reply_sent"] = reply_sent
+        result["_reminder"] = reminder
+        return result
     except Exception:
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
@@ -521,22 +574,74 @@ async def draft_reply(pool, sub: str, role: str, ticket_id: str, reminder: str) 
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT id, subject, body, status, created_by FROM tickets WHERE id = %s",
+                    "SELECT id, subject, body, status, priority, created_by, assigned_to "
+                    "FROM tickets WHERE id = %s",
                     (ticket_id,),
                 )
                 row = await cur.fetchone()
                 if row is None:
                     return {"message": "not found", "_reminder": reminder}
 
-        draft = (
-            f"Thank you for reaching out regarding '{row[1]}'.\n\n"
-            f"I have reviewed your ticket and understand the situation. "
-            f"Here is my response:\n\n"
-            f"[Draft response — please review and personalize before sending.]\n\n"
-            f"Best regards,\nAI Support Agent"
-        )
-        await log_audit(pool, sub, "domain_draft_reply", f"ticket={ticket_id}", "draft generated")
-        return {"draft": draft, "ticket_id": ticket_id, "_reminder": reminder}
+                t_subject, t_body, t_status, t_priority = row[1], row[2], row[3], row[4]
+                t_creator, t_assigned = row[5], row[6]
+
+                if t_body:
+                    keywords = " ".join(t_body.split()[:10])
+                    await cur.execute(
+                        "SELECT id, content FROM support_embeddings "
+                        "WHERE entity_type = 'policy' AND content->>'title' ILIKE %s LIMIT 1",
+                        (f"%{keywords[:50]}%",),
+                    )
+                    policy_row = await cur.fetchone()
+                    if policy_row is None:
+                        await cur.execute(
+                            "SELECT id, content FROM support_embeddings "
+                            "WHERE entity_type = 'policy' LIMIT 1",
+                        )
+                        policy_row = await cur.fetchone()
+                else:
+                    policy_row = None
+
+                policy_id = policy_row[0] if policy_row else None
+                policy_content = policy_row[1] if policy_row else None
+                policy_title = policy_content.get("title") if policy_content else None
+                policy_excerpt = (policy_content.get("body", "")[:300] if policy_content else None)
+
+                await cur.execute(
+                    "SELECT COUNT(*), AVG(csat_score) FROM tickets "
+                    "WHERE created_by = %s AND csat_score IS NOT NULL",
+                    (t_creator,),
+                )
+                hist_row = await cur.fetchone()
+                hist_count = hist_row[0] if hist_row else 0
+                hist_avg = round(float(hist_row[1]), 1) if hist_row and hist_row[1] is not None else None
+
+                customer_history: str | None = None
+                if hist_count > 0:
+                    customer_history = f"{hist_count} previous tickets"
+                    if hist_avg is not None:
+                        customer_history += f", CSAT avg {hist_avg}"
+                agent_name = t_assigned
+                recommended_action: str | None = None
+                if not agent_name:
+                    recommended_action = "Assign an agent first before drafting a reply."
+                elif not t_body:
+                    recommended_action = "The ticket has no details yet — ask the customer to provide more information."
+                elif policy_id:
+                    recommended_action = f"Review {policy_title} ({policy_id}) and respond per policy guidelines."
+
+        await log_audit(pool, sub, "domain_draft_reply", f"ticket={ticket_id}", "context generated")
+        return {
+            "ticket_id": ticket_id, "customer_name": t_creator,
+            "ticket_subject": t_subject, "ticket_body": t_body or "",
+            "ticket_status": t_status, "ticket_priority": t_priority,
+            "policy_id": policy_id, "policy_title": policy_title,
+            "policy_excerpt": policy_excerpt,
+            "customer_history": customer_history,
+            "agent_name": agent_name,
+            "recommended_action": recommended_action,
+            "_reminder": reminder,
+        }
     except Exception:
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
