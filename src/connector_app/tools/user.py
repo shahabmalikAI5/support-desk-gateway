@@ -51,10 +51,39 @@ async def configure_notifications(pool, sub: str, reminder: str, *,
                                    email: str | None = None,
                                    webhook_url: str | None = None,
                                    events: list[str] | None = None) -> dict:
+    valid_events = {"status_changed", "agent_assigned", "resolution", "all"}
+    if email is not None and email != "":
+        if "@" not in email or "." not in email.split("@")[-1]:
+            return {"error": "email is not a valid email address", "_reminder": reminder}
+    if webhook_url is not None and webhook_url != "":
+        if not webhook_url.startswith("https://"):
+            return {"error": "webhook URL must start with https://", "_reminder": reminder}
+    if events is not None:
+        for e in events:
+            if e not in valid_events:
+                return {
+                    "error": f"unknown event: {e}. Valid events: status_changed, agent_assigned, resolution, all",
+                    "_reminder": reminder,
+                }
+    if email is None and webhook_url is None and events is None:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT email, webhook_url, events FROM notification_config WHERE user_sub = %s",
+                    (sub,),
+                )
+                row = await cur.fetchone()
+                if row is None:
+                    return {"email": None, "webhook_url": None, "events": [], "_reminder": reminder}
+                return {
+                    "email": row[0], "webhook_url": row[1],
+                    "events": row[2] if row[2] else [],
+                    "_reminder": reminder,
+                }
+
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                existing: tuple | None = None
                 await cur.execute(
                     "SELECT email, webhook_url, events FROM notification_config WHERE user_sub = %s",
                     (sub,),
@@ -63,10 +92,12 @@ async def configure_notifications(pool, sub: str, reminder: str, *,
 
                 final_email = email if email is not None else (existing[0] if existing else None)
                 final_webhook = webhook_url if webhook_url is not None else (existing[1] if existing else None)
-                final_events = events if events is not None else (existing[2] if existing else [])
+                final_events = events if events is not None else (existing[2] if existing else ["status_changed"])
 
+                if "all" in (final_events or []):
+                    final_events = ["status_changed", "agent_assigned", "resolution"]
                 if final_events is None:
-                    final_events = []
+                    final_events = ["status_changed"]
 
                 await cur.execute(
                     "INSERT INTO notification_config (user_sub, email, webhook_url, events, updated_at) "
