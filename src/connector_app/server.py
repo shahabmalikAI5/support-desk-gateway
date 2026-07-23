@@ -321,13 +321,13 @@ async def domain_get_attachment(attachment_id: str, session_token: str) -> dict:
 
 
 @mcp.tool
-async def domain_sync_to_freshdesk(mode: str, session_token: str) -> dict:
-    """Sync tickets to Freshdesk. mode: 'push' (one-shot) or 'pull' (fetch updates)."""
+async def domain_sync_to_freshdesk(ticket_id: str, session_token: str, action: str = "push") -> dict:
+    """Sync a ticket to Freshdesk. action: push (send), pull (fetch), sync_bi (both)."""
     sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
     pool = await get_pool()
-    return await domain_tools.sync_to_freshdesk(pool, sub, role, mode, _REMINDER)
+    return await domain_tools.sync_to_freshdesk(pool, sub, role, ticket_id, action, _REMINDER)
 
 
 # ── user_* tools ──────────────────────────────────────────────────────────────

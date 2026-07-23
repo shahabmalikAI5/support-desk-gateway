@@ -9,15 +9,31 @@ import asyncio
 import os
 
 
-async def _sync_one_ticket(pool, ticket_id: str, freshdesk_id: str) -> None:
-    """Pull the latest status from Freshdesk for a single synced ticket."""
-    api_key = os.environ.get("FRESHDESK_API_KEY")
-    domain = os.environ.get("FRESHDESK_DOMAIN")
-    if not api_key or not domain:
-        return
+_FD_STATUS_REVERSE = {3: "pending", 4: "resolved", 5: "closed"}
+
+
+async def _get_fd_creds(pool) -> tuple[str | None, str | None]:
+    """Read Freshdesk credentials from config store, fall back to env vars."""
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SELECT value FROM config WHERE key = 'freshdesk_api_key'")
+                r1 = await cur.fetchone()
+                await cur.execute("SELECT value FROM config WHERE key = 'freshdesk_domain'")
+                r2 = await cur.fetchone()
+                if r1 and r2:
+                    return r1[0], r2[0]
+    except Exception:
+        pass
+    return os.environ.get("FRESHDESK_API_KEY"), os.environ.get("FRESHDESK_DOMAIN")
+
+
+async def _pull_one(pool, ticket_id: str, freshdesk_id: str, api_key: str, domain: str) -> None:
+    """Pull the latest status from Freshdesk for a single synced ticket.
+    Only resolves and closed propagate from FD to local. FD Status 2 is ignored."""
     try:
         import httpx
-        auth = (api_key, "X")
+        auth = httpx.BasicAuth(api_key, "X")
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 f"https://{domain}.freshdesk.com/api/v2/tickets/{freshdesk_id}",
@@ -28,10 +44,11 @@ async def _sync_one_ticket(pool, ticket_id: str, freshdesk_id: str) -> None:
                 return
             data = resp.json()
             fd_status = data.get("status")
-            status_map = {2: "open", 3: "pending", 4: "in_progress", 5: "resolved", 6: "closed"}
-            new_status = status_map.get(fd_status)
 
-        if new_status:
+            new_status = _FD_STATUS_REVERSE.get(fd_status)
+            if not new_status:
+                return
+
             async with pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
@@ -39,6 +56,16 @@ async def _sync_one_ticket(pool, ticket_id: str, freshdesk_id: str) -> None:
                         "WHERE id = %s AND freshdesk_id IS NOT NULL",
                         (new_status, ticket_id),
                     )
+                    if new_status == "resolved":
+                        await cur.execute(
+                            "UPDATE tickets SET resolved_at = now() WHERE id = %s",
+                            (ticket_id,),
+                        )
+                    elif new_status == "closed":
+                        await cur.execute(
+                            "UPDATE tickets SET closed_at = now() WHERE id = %s",
+                            (ticket_id,),
+                        )
     except Exception:
         pass
 
@@ -47,19 +74,25 @@ async def sync_loop(pool) -> None:
     """Background loop: poll Freshdesk every 15 minutes for synced tickets."""
     while True:
         try:
+            api_key, domain = await _get_fd_creds(pool)
+            if not api_key or not domain:
+                await asyncio.sleep(900)
+                continue
+
             async with pool.connection() as conn:
                 async with conn.cursor() as cur:
                     await cur.execute(
                         "SELECT id, freshdesk_id FROM tickets "
-                        "WHERE freshdesk_id IS NOT NULL AND freshdesk_synced_at IS NOT NULL"
+                        "WHERE freshdesk_id IS NOT NULL "
+                        "AND status IN ('open', 'in_progress')"
                     )
                     rows = await cur.fetchall()
 
             for ticket_id, freshdesk_id in rows:
-                await _sync_one_ticket(pool, ticket_id, freshdesk_id)
+                await _pull_one(pool, ticket_id, freshdesk_id, api_key, domain)
         except Exception:
             pass
-        await asyncio.sleep(900)  # 15 minutes
+        await asyncio.sleep(900)
 
 
 def start_background_sync(pool) -> asyncio.Task:
