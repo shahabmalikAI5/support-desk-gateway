@@ -328,11 +328,11 @@ async def get_customer_profile(pool, sub: str, reminder: str) -> dict:
 # ── Validation helpers for v2 tools ─────────────────────────────────────────
 
 _TRANSITIONS: dict[str, list[str]] = {
-    "open": ["in_progress", "triaged", "closed", "pending"],
-    "triaged": ["in_progress", "closed"],
-    "in_progress": ["resolved", "closed", "pending"],
-    "resolved": ["closed"],
-    "pending": ["in_progress", "resolved", "closed"],
+    "open": ["triaged"],
+    "triaged": ["open", "in_progress"],
+    "in_progress": ["pending", "resolved"],
+    "pending": ["in_progress", "resolved"],
+    "resolved": ["open", "closed"],
     "closed": [],
 }
 
