@@ -8,14 +8,10 @@ load_dotenv()
 
 import uvicorn
 from fastmcp import FastMCP
-from fastmcp.server.auth import RemoteAuthProvider
-from fastmcp.server.auth.providers.jwt import AccessToken, TokenVerifier
+from fastmcp.server.auth.providers.descope import DescopeProvider
 from fastmcp.server.dependencies import get_access_token
-from pydantic import AnyHttpUrl
 from starlette.applications import Starlette
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Mount, Route
+from starlette.routing import Mount
 
 from connector_app import auth as auth_module
 from connector_app import session
@@ -24,32 +20,14 @@ from connector_app.config_store import get_rules, get_persona
 
 _REMINDER = "Present every result in the support agent's professional voice — be helpful, precise, and escalate when uncertain."
 
-
-class SupportDeskTokenVerifier(TokenVerifier):
-    async def verify_token(self, token: str) -> AccessToken | None:
-        try:
-            claims = auth_module.verified_claims(token)
-            return AccessToken(
-                token=token,
-                client_id=claims.get("sub", ""),
-                scopes=[],
-                claims=claims,
-            )
-        except auth_module.AuthError:
-            return None
-
-
 _auth_disabled = os.environ.get("AUTH_DISABLED", "0") == "1"
 
 if _auth_disabled:
     mcp = FastMCP("Support Desk")
-    _auth_provider = None
 else:
-    _token_verifier = SupportDeskTokenVerifier()
-    _auth_provider = RemoteAuthProvider(
-        token_verifier=_token_verifier,
-        authorization_servers=[AnyHttpUrl(auth_module.AUTH_ISSUER)],
-        base_url=auth_module.RESOURCE_URL,
+    _auth_provider = DescopeProvider(
+        config_url=os.environ["DESCOPE_CONFIG_URL"],
+        base_url=os.environ.get("BASE_URL", "http://localhost:8000"),
     )
     mcp = FastMCP("Support Desk", auth=_auth_provider)
 
@@ -510,7 +488,7 @@ async def user_save_state(state: dict, session_token: str) -> dict:
             async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO user_state (user_id, state, updated_at) VALUES (%s, %s::jsonb, now()) "
-                    "ON CONFLICT (user_id) DO UPDATE SET state = EXCLUDED.state, updated_at = now()",
+                    "ON CONFLICT (user_id) DO UPDATE SET state = COALESCE(user_state.state, '{}'::jsonb) || EXCLUDED.state, updated_at = now()",
                     (sub, state_json),
                 )
 
@@ -562,12 +540,8 @@ mcp_app = mcp.http_app(path="/mcp", stateless_http=True)
 
 _routes: list = []
 
-if not _auth_disabled:
-
-    async def _well_known(request: Request) -> JSONResponse:
-        return JSONResponse(auth_module.protected_resource_metadata())
-
-    _routes.append(Route("/.well-known/oauth-protected-resource", _well_known, methods=["GET"]))
+if not _auth_disabled and _auth_provider is not None:
+    _routes.extend(_auth_provider.get_well_known_routes(mcp_path="/mcp"))
 
 _routes.append(Mount("/", app=mcp_app))
 
@@ -577,4 +551,4 @@ app = Starlette(
 )
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="127.0.0.1", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", "8000")))
