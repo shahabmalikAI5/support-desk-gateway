@@ -1,0 +1,22 @@
+[
+  {
+    "id": "att-001",
+    "ticket_id": "tkt-014",
+    "file_name": "received_item.jpg",
+    "mime_type": "image/jpeg",
+    "size_bytes": 245760,
+    "r2_key": "tkt-014/att-001-received_item.jpg",
+    "uploaded_by": "user-priya-88",
+    "uploaded_at": "2026-07-16T14:00:00Z"
+  },
+  {
+    "id": "att-002",
+    "ticket_id": "tkt-014",
+    "file_name": "packing_slip.png",
+    "mime_type": "image/png",
+    "size_bytes": 512000,
+    "r2_key": "tkt-014/att-002-packing_slip.png",
+    "uploaded_by": "user-priya-88",
+    "uploaded_at": "2026-07-16T14:05:00Z"
+  }
+]

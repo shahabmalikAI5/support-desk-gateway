@@ -1,0 +1,10 @@
+[
+  {
+    "user_sub": "dev-user-001",
+    "email": "dev@example.com",
+    "webhook_url": null,
+    "events": ["status_changed", "agent_assigned"],
+    "created_at": "2026-07-22T00:00:00Z",
+    "updated_at": "2026-07-22T00:00:00Z"
+  }
+]

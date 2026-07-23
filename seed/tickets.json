@@ -1,0 +1,70 @@
+[
+  {
+    "id": "tkt-010",
+    "subject": "Login issue after password reset",
+    "body": "I reset my password but now I can't log in with the new password. It says 'invalid credentials'.",
+    "status": "open",
+    "priority": "high",
+    "category": "account",
+    "created_by": "dev-user-001",
+    "created_at": "2026-07-22T10:00:00Z",
+    "source": "mcp"
+  },
+  {
+    "id": "tkt-011",
+    "subject": "Subscription renewal double charge",
+    "body": "I was charged twice for my monthly subscription. One payment went through on the 1st and another on the 2nd.",
+    "status": "triaged",
+    "priority": "high",
+    "category": "billing",
+    "created_by": "user-alice-42",
+    "created_at": "2026-07-21T14:30:00Z",
+    "assigned_to": "Ravi",
+    "assigned_at": "2026-07-22T09:00:00Z",
+    "source": "mcp"
+  },
+  {
+    "id": "tkt-012",
+    "subject": "Shipping address update request",
+    "body": "I need to change my shipping address for order ORD-8821 before it ships.",
+    "status": "in_progress",
+    "priority": "medium",
+    "category": "shipping",
+    "created_by": "user-marcus-55",
+    "created_at": "2026-07-20T08:15:00Z",
+    "assigned_to": "Ravi",
+    "assigned_at": "2026-07-20T10:00:00Z",
+    "source": "mcp"
+  },
+  {
+    "id": "tkt-013",
+    "subject": "Feature request: dark mode",
+    "body": "Would love to see a dark mode option in the dashboard. Many of us work late and the bright white is hard on the eyes.",
+    "status": "pending",
+    "priority": "low",
+    "category": "other",
+    "created_by": "dev-user-001",
+    "created_at": "2026-07-18T16:45:00Z",
+    "assigned_to": "Priya",
+    "assigned_at": "2026-07-19T09:00:00Z",
+    "source": "mcp"
+  },
+  {
+    "id": "tkt-014",
+    "subject": "Wrong item received in shipment",
+    "body": "I ordered a USB-C Hub but received a laptop stand instead. Order number ORD-9912.",
+    "status": "resolved",
+    "priority": "high",
+    "category": "returns",
+    "created_by": "user-priya-88",
+    "created_at": "2026-07-16T11:00:00Z",
+    "assigned_to": "Ravi",
+    "assigned_at": "2026-07-16T14:00:00Z",
+    "resolved_at": "2026-07-17T10:30:00Z",
+    "csat_score": 4,
+    "csat_submitted_at": "2026-07-17T12:00:00Z",
+    "freshdesk_id": "FD-1001",
+    "freshdesk_synced_at": "2026-07-17T11:00:00Z",
+    "source": "mcp"
+  }
+]
