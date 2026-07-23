@@ -727,9 +727,8 @@ async def attach_file(pool, sub: str, role: str, ticket_id: str, file_name: str,
                     return {"error": "ticket already has 10 attachments", "_reminder": reminder}
 
         r2_key = f"{ticket_id}/{uuid.uuid4().hex[:8]}-{file_name}"
-        try:
-            await _store_file(r2_key, base64.b64encode(raw_bytes).decode())
-        except Exception:
+        stored = await _store_file(r2_key, raw_bytes)
+        if not stored:
             return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
         attachment_id = f"att-{uuid.uuid4().hex[:8]}"
@@ -770,13 +769,30 @@ async def get_attachment(pool, sub: str, attachment_id: str, reminder: str, *, r
                 elif ticket_creator != sub:
                     return {"message": "not found", "_reminder": reminder}
 
-        file_data = await _read_file(row[5])
-        import base64
+                r2_key = row[5]
+                now_iso = _now_iso()
+                expires_at = datetime.fromisoformat(now_iso).timestamp() + 900
+                url_expires_at = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
+
+        presigned_url = await _presigned_url(r2_key)
+        if presigned_url is None and r2_key in _ATTACHMENT_STORE:
+            import base64
+            await log_audit(pool, sub, "domain_get_attachment", f"attachment={attachment_id}", "retrieved (memory)")
+            return {
+                "attachment_id": row[0], "ticket_id": row[1], "file_name": row[2],
+                "mime_type": row[3], "size_bytes": row[4],
+                "file_data": base64.b64encode(_ATTACHMENT_STORE[r2_key]).decode(),
+                "uploaded_by": row[6],
+                "uploaded_at": row[7].isoformat() if row[7] else None,
+                "url_expires_at": url_expires_at,
+                "_reminder": reminder,
+            }
         await log_audit(pool, sub, "domain_get_attachment", f"attachment={attachment_id}", "retrieved")
         return {
-            "id": row[0], "ticket_id": row[1], "file_name": row[2],
+            "attachment_id": row[0], "ticket_id": row[1], "file_name": row[2],
             "mime_type": row[3], "size_bytes": row[4],
-            "file_data": base64.b64encode(file_data).decode() if file_data else None,
+            "presigned_url": presigned_url,
+            "url_expires_at": url_expires_at,
             "uploaded_by": row[6],
             "uploaded_at": row[7].isoformat() if row[7] else None,
             "_reminder": reminder,
@@ -819,20 +835,57 @@ async def sync_to_freshdesk(pool, sub: str, role: str, mode: str, reminder: str)
 _ATTACHMENT_STORE: dict[str, bytes] = {}
 
 
-async def _store_file(r2_key: str, base64_data: str) -> None:
-    import base64
-    _ATTACHMENT_STORE[r2_key] = base64.b64decode(base64_data)
+def _r2_client():
+    """Create a boto3 S3 client for Cloudflare R2. Returns None if not configured."""
+    key_id = os.environ.get("R2_ACCESS_KEY_ID")
+    secret = os.environ.get("R2_SECRET_ACCESS_KEY")
+    endpoint = os.environ.get("R2_ENDPOINT")
+    if not key_id or not secret or not endpoint:
+        return None
+    import boto3
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint,
+        aws_access_key_id=key_id,
+        aws_secret_access_key=secret,
+    )
 
 
-async def _read_file(r2_key: str) -> bytes:
-    return _ATTACHMENT_STORE.get(r2_key, b"")
+async def _store_file(r2_key: str, raw_bytes: bytes) -> bool:
+    """Upload bytes to R2. Falls back to in-memory store. Returns True on success."""
+    client = _r2_client()
+    if client is not None:
+        bucket = os.environ.get("R2_BUCKET", "support-desk-attachments")
+        try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None, lambda: client.put_object(Bucket=bucket, Key=r2_key, Body=raw_bytes)
+            )
+            return True
+        except Exception:
+            return False
+    _ATTACHMENT_STORE[r2_key] = raw_bytes
+    return True
 
 
-def _guess_mime(name: str) -> str:
-    ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    return {
-        "jpg": "image/jpeg", "jpeg": "image/jpeg", "png": "image/png",
-        "gif": "image/gif", "pdf": "application/pdf", "doc": "application/msword",
-        "docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        "csv": "text/csv", "txt": "text/plain",
-    }.get(ext, "application/octet-stream")
+async def _presigned_url(r2_key: str, expires_in: int = 900) -> str | None:
+    """Generate a presigned GET URL from R2. Falls back to None."""
+    client = _r2_client()
+    if client is not None:
+        bucket = os.environ.get("R2_BUCKET", "support-desk-attachments")
+        try:
+            import asyncio
+            loop = asyncio.get_running_loop()
+            url = await loop.run_in_executor(
+                None,
+                lambda: client.generate_presigned_url(
+                    "get_object",
+                    Params={"Bucket": bucket, "Key": r2_key},
+                    ExpiresIn=expires_in,
+                ),
+            )
+            return url
+        except Exception:
+            return None
+    return None
