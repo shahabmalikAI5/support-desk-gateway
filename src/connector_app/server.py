@@ -18,6 +18,7 @@ from connector_app.config_store import get_rules, get_persona
 from connector_app.tools import domain as domain_tools
 from connector_app.tools import user as user_tools
 from connector_app.tools import config as config_tools
+from connector_app import catalog as catalog_tools
 from connector_app import role_gate
 
 _REMINDER = "Present every result in the support agent's professional voice — be helpful, precise, and escalate when uncertain."
@@ -432,6 +433,48 @@ async def config_set_shopify_creds(access_token: str, store_domain: str, session
         return err
     pool = await get_pool()
     return await config_tools.set_shopify_creds(pool, sub, role, access_token, store_domain, _REMINDER)
+
+
+# ── catalog_* tools ──────────────────────────────────────────────────────────
+
+@mcp.tool
+async def catalog_set_policy(policy_id: str, title: str, body: str, applies_to: str, session_token: str) -> dict:
+    """Create or update a policy in the catalog. Generates embedding for semantic search."""
+    sub, role, err = _validate_session(session_token)
+    if err is not None:
+        return err
+    pool = await get_pool()
+    return await catalog_tools.set_policy(pool, sub, role, policy_id, title, body, applies_to, _REMINDER)
+
+
+@mcp.tool
+async def catalog_set_order(order_id: str, content: dict, session_token: str) -> dict:
+    """Create or update an order in the catalog. Generates embedding for semantic search."""
+    sub, role, err = _validate_session(session_token)
+    if err is not None:
+        return err
+    pool = await get_pool()
+    return await catalog_tools.set_order(pool, sub, role, order_id, content, _REMINDER)
+
+
+@mcp.tool
+async def catalog_delete_item(item_id: str, entity_type: str, session_token: str) -> dict:
+    """Delete a catalog item (policy or order)."""
+    sub, role, err = _validate_session(session_token)
+    if err is not None:
+        return err
+    pool = await get_pool()
+    return await catalog_tools.delete_item(pool, sub, role, item_id, entity_type, _REMINDER)
+
+
+@mcp.tool
+async def catalog_list_all(entity_type: str, session_token: str) -> dict:
+    """List all catalog items of a given type (policy or order)."""
+    sub, role, err = _validate_session(session_token)
+    if err is not None:
+        return err
+    pool = await get_pool()
+    return await catalog_tools.list_all(pool, sub, role, entity_type, _REMINDER)
 
 
 # ── Starlette deployment ──────────────────────────────────────────────────────
