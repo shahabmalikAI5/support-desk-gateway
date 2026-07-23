@@ -3,6 +3,7 @@
 import os
 import uuid
 from datetime import datetime, timezone
+from psycopg.types.json import Jsonb
 
 
 def _now_iso() -> str:
@@ -243,7 +244,7 @@ async def create_ticket(pool, sub: str, subject: str, body: str, priority: str, 
                         "INSERT INTO support_embeddings (id, entity_type, content, embedding) "
                         "VALUES (%s, 'ticket', %s::jsonb, %s::vector) "
                         "ON CONFLICT (id, entity_type) DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding",
-                        (ticket_id, ticket_content, embedding),
+                        (ticket_id, Jsonb(ticket_content), embedding),
                     )
 
         created_at = row[0].isoformat() if row and row[0] else _now_iso()

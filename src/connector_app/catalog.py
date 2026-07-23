@@ -2,6 +2,7 @@
 
 import json
 import os
+from psycopg.types.json import Jsonb
 
 
 async def _get_embedding(text: str) -> list[float] | None:
@@ -58,14 +59,14 @@ async def set_policy(pool, sub: str, role: str, policy_id: str, title: str, body
                         "INSERT INTO support_embeddings (id, entity_type, content, embedding) "
                         "VALUES (%s, 'policy', %s::jsonb, %s::vector) "
                         "ON CONFLICT (id, entity_type) DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding",
-                        (policy_id, content, embedding),
+                        (policy_id, Jsonb(content), embedding),
                     )
                 else:
                     await cur.execute(
                         "INSERT INTO support_embeddings (id, entity_type, content) "
-                        "VALUES (%s, 'policy', %s::jsonb) "
+                        "                        VALUES (%s, 'policy', %s::jsonb) "
                         "ON CONFLICT (id, entity_type) DO UPDATE SET content = EXCLUDED.content, embedding = NULL",
-                        (policy_id, content),
+                        (policy_id, Jsonb(content)),
                     )
 
         from connector_app.tools.domain import log_audit
@@ -107,14 +108,14 @@ async def set_order(pool, sub: str, role: str, order_id: str, content: dict, rem
                         "INSERT INTO support_embeddings (id, entity_type, content, embedding) "
                         "VALUES (%s, 'order', %s::jsonb, %s::vector) "
                         "ON CONFLICT (id, entity_type) DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding",
-                        (order_id, content, embedding),
+                        (order_id, Jsonb(content), embedding),
                     )
                 else:
                     await cur.execute(
                         "INSERT INTO support_embeddings (id, entity_type, content) "
                         "VALUES (%s, 'order', %s::jsonb) "
                         "ON CONFLICT (id, entity_type) DO UPDATE SET content = EXCLUDED.content, embedding = NULL",
-                        (order_id, content),
+                        (order_id, Jsonb(content)),
                     )
 
         from connector_app.tools.domain import log_audit
