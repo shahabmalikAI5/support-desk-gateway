@@ -1,6 +1,7 @@
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -10,7 +11,7 @@ import uvicorn
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.descope import DescopeProvider
 from starlette.applications import Starlette
-from starlette.responses import FileResponse
+from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
 
 from connector_app import auth as auth_module
@@ -483,8 +484,17 @@ async def catalog_list_all(session_token: str, entity_type: str | None = None, l
 
 # ── Admin dashboard route ─────────────────────────────────────────────────────
 
+_ADMIN_HTML = Path(__file__).resolve().parent.parent.parent / "admin" / "index.html"
+
+
 async def _admin_page(request):
-    return FileResponse("admin/index.html")
+    return FileResponse(str(_ADMIN_HTML))
+
+
+# ── Health endpoint ──────────────────────────────────────────────────────────
+
+async def _health_endpoint(request):
+    return JSONResponse({"status": "ok"})
 
 
 # ── Background sync ──────────────────────────────────────────────────────────
@@ -519,6 +529,7 @@ _routes: list = []
 if not _auth_disabled and _auth_provider is not None:
     _routes.extend(_auth_provider.get_well_known_routes(mcp_path="/mcp"))
 
+_routes.append(Route("/health", endpoint=_health_endpoint, methods=["GET"]))
 _routes.append(Route("/admin", endpoint=_admin_page))
 _routes.append(Mount("/", app=mcp_app))
 
