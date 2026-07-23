@@ -12,6 +12,8 @@ def _now_iso() -> str:
 
 _WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 _SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
+_SENDER_EMAIL = os.environ.get("SENDGRID_SENDER_EMAIL", "shahabmalikAI5@gmail.com")
+_SENDER_NAME = os.environ.get("SENDGRID_SENDER_NAME", "Support Desk")
 
 
 async def send_email(to_email: str, subject: str, body: str) -> bool:
@@ -29,7 +31,7 @@ async def send_email(to_email: str, subject: str, body: str) -> bool:
                 },
                 json={
                     "personalizations": [{"to": [{"email": to_email}]}],
-                    "from": {"email": "support@connector.app", "name": "Support Desk"},
+                    "from": {"email": _SENDER_EMAIL, "name": _SENDER_NAME},
                     "subject": subject,
                     "content": [{"type": "text/plain", "value": body}],
                 },
