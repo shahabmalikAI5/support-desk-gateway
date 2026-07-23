@@ -97,6 +97,23 @@ def bearer_from_header(authorization_header: str | None) -> str:
     return authorization_header.split(" ", 1)[1].strip()
 
 
+def get_access_token_claims() -> dict[str, Any] | None:
+    """Return the full claims dict from the current request's access token.
+    
+    Wraps FastMCP's get_access_token() to give the role-extraction logic
+    a single place to read claims. Returns None when no token is present
+    (AUTH_DISABLED=1 or unauthenticated route).
+    """
+    try:
+        from fastmcp.server.dependencies import get_access_token as _gat
+        tk = _gat()
+        if tk is not None and tk.claims:
+            return tk.claims
+    except Exception:
+        pass
+    return None
+
+
 def protected_resource_metadata() -> dict[str, Any]:
     """The discovery note published at /.well-known/oauth-protected-resource (RFC 9728).
 

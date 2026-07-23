@@ -9,7 +9,6 @@ load_dotenv()
 import uvicorn
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.descope import DescopeProvider
-from fastmcp.server.dependencies import get_access_token
 from starlette.applications import Starlette
 from starlette.routing import Mount
 
@@ -34,11 +33,21 @@ else:
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
-def _get_sub() -> str:
-    token = get_access_token()
-    if token is not None and token.claims:
-        return token.claims.get("sub", os.environ.get("DEV_SUB", "dev-user-001"))
-    return os.environ.get("DEV_SUB", "dev-user-001")
+def _get_claims() -> tuple[str, str | None]:
+    """Return (sub, role) from the current request's access token."""
+    claims = auth_module.get_access_token_claims()
+    if claims is not None:
+        sub = claims.get("sub", os.environ.get("DEV_SUB", "dev-user-001"))
+        role: str | None = None
+        raw = claims.get("roles", None)
+        if isinstance(raw, list) and len(raw) > 0:
+            role = str(raw[0])
+        elif isinstance(raw, str):
+            role = raw
+        if role is None:
+            role = claims.get("role", None)
+        return sub, role
+    return os.environ.get("DEV_SUB", "dev-user-001"), None
 
 
 def _validate_session(session_token: str | None) -> tuple[str | None, str | None, dict | None]:
@@ -78,7 +87,7 @@ async def health() -> dict:
 @mcp.tool
 async def begin_session() -> dict:
     """Call this FIRST on any new request or new chat. Returns rules, persona, state, and a session token."""
-    sub = _get_sub()
+    sub, role = _get_claims()
     pool = await get_pool()
 
     try:
@@ -114,7 +123,7 @@ async def begin_session() -> dict:
 
         rules = await get_rules(pool)
         persona = await get_persona(pool)
-        session_token = session.new_session_token(sub)
+        session_token = session.new_session_token(sub, role=role)
 
         return {
             "rules": rules,
@@ -127,17 +136,19 @@ async def begin_session() -> dict:
                 "session_started_at": _now_iso(),
             },
             "session_token": session_token,
+            "role": role,
             "reminder": _REMINDER,
         }
     except Exception:
         rules = await get_rules(pool)
         persona = await get_persona(pool)
-        session_token = session.new_session_token(sub)
+        session_token = session.new_session_token(sub, role=role)
         return {
             "rules": rules,
             "persona": persona,
             "state": {},
             "session_token": session_token,
+            "role": role,
             "reminder": _REMINDER,
         }
 
