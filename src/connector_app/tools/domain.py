@@ -1,11 +1,31 @@
 """domain_* tool implementations — all DB logic lives here, not in server.py."""
 
+import os
 import uuid
 from datetime import datetime, timezone
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+async def _get_embedding(text: str) -> list[float] | None:
+    api_key = os.environ.get("MISTRAL_API_KEY")
+    if not api_key or not text:
+        return None
+    try:
+        import httpx
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                "https://api.mistral.ai/v1/embeddings",
+                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                json={"model": "mistral-embed", "input": [text]},
+                timeout=30.0,
+            )
+            resp.raise_for_status()
+            return resp.json()["data"][0]["embedding"]
+    except Exception:
+        return None
 
 
 async def log_audit(pool, user_id: str, tool_name: str, input_summary: str, output_summary: str) -> None:
@@ -20,7 +40,7 @@ async def log_audit(pool, user_id: str, tool_name: str, input_summary: str, outp
         pass
 
 
-async def get_ticket(pool, sub: str, id: str, reminder: str) -> dict:
+async def get_ticket(pool, sub: str, id: str, reminder: str, *, role: str | None = None) -> dict:
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -31,6 +51,11 @@ async def get_ticket(pool, sub: str, id: str, reminder: str) -> dict:
                 )
                 row = await cur.fetchone()
                 if row is None:
+                    return {"message": "not found", "_reminder": reminder}
+
+                ticket_creator = row[5]
+                is_staff = role is not None and role in ("admin", "staff")
+                if not is_staff and ticket_creator != sub:
                     return {"message": "not found", "_reminder": reminder}
 
                 await log_audit(pool, sub, "domain_get_ticket", f"id={id}", f"found ticket {id}")
@@ -86,7 +111,7 @@ async def get_policy(pool, sub: str, id: str, reminder: str) -> dict:
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
 
-async def search(pool, sub: str, query: str, reminder: str) -> dict:
+async def search(pool, sub: str, query: str, reminder: str, *, include_my_tickets: bool = False) -> dict:
     if not query or not query.strip():
         return {"error": "query is required", "_reminder": reminder}
 
@@ -95,31 +120,35 @@ async def search(pool, sub: str, query: str, reminder: str) -> dict:
         return {"error": "Search temporarily unavailable.", "_reminder": reminder}
 
     try:
-        import httpx
-        async with httpx.AsyncClient() as client:
-            emb_resp = await client.post(
-                "https://api.mistral.ai/v1/embeddings",
-                headers={"Authorization": f"Bearer {mistral_key}", "Content-Type": "application/json"},
-                json={"model": "mistral-embed", "input": [query]},
-                timeout=30.0,
-            )
-            emb_resp.raise_for_status()
-            embedding = emb_resp.json()["data"][0]["embedding"]
+        embedding = await _get_embedding(query)
+        if embedding is None:
+            return {"error": "Search temporarily unavailable.", "_reminder": reminder}
 
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT id, entity_type, content, 1 - (embedding <=> %s::vector) AS similarity "
-                    "FROM support_embeddings WHERE embedding IS NOT NULL "
-                    "ORDER BY embedding <=> %s::vector LIMIT 10",
-                    (embedding, embedding),
-                )
+                if include_my_tickets:
+                    await cur.execute(
+                        "SELECT id, entity_type, content, 1 - (embedding <=> %s::vector) AS similarity "
+                        "FROM support_embeddings WHERE embedding IS NOT NULL "
+                        "AND ((entity_type IN ('order', 'policy')) "
+                        "OR (entity_type = 'ticket' AND content->>'created_by' = %s)) "
+                        "ORDER BY embedding <=> %s::vector LIMIT 10",
+                        (embedding, sub, embedding),
+                    )
+                else:
+                    await cur.execute(
+                        "SELECT id, entity_type, content, 1 - (embedding <=> %s::vector) AS similarity "
+                        "FROM support_embeddings WHERE embedding IS NOT NULL "
+                        "AND entity_type IN ('order', 'policy') "
+                        "ORDER BY embedding <=> %s::vector LIMIT 10",
+                        (embedding, embedding),
+                    )
                 rows = await cur.fetchall()
 
         results = []
         for row in rows:
             content = row[2] if isinstance(row[2], dict) else {}
-            body = content.get("body", "") or content.get("title", "")
+            body = content.get("body", "") or content.get("title", "") or content.get("subject", "")
             results.append({
                 "id": row[0], "entity_type": row[1],
                 "content": body[:200] if body else "",
@@ -154,6 +183,18 @@ async def create_ticket(pool, sub: str, subject: str, body: str, priority: str, 
                     (ticket_id, subject.strip(), body.strip(), priority, sub),
                 )
                 row = await cur.fetchone()
+
+        embedding = await _get_embedding(f"{subject.strip()} {body.strip()}")
+        ticket_content = {"subject": subject.strip(), "body": body.strip(), "created_by": sub}
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                if embedding:
+                    await cur.execute(
+                        "INSERT INTO support_embeddings (id, entity_type, content, embedding) "
+                        "VALUES (%s, 'ticket', %s::jsonb, %s::vector) "
+                        "ON CONFLICT (id, entity_type) DO UPDATE SET content = EXCLUDED.content, embedding = EXCLUDED.embedding",
+                        (ticket_id, ticket_content, embedding),
+                    )
 
         created_at = row[0].isoformat() if row and row[0] else _now_iso()
         await log_audit(pool, sub, "domain_create_ticket", f"subject={subject[:50]}", f"created {ticket_id}")
@@ -599,17 +640,22 @@ async def attach_file(pool, sub: str, role: str, ticket_id: str, file_name: str,
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
 
-async def get_attachment(pool, sub: str, attachment_id: str, reminder: str) -> dict:
+async def get_attachment(pool, sub: str, attachment_id: str, reminder: str, *, role: str | None = None) -> dict:
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT id, ticket_id, file_name, mime_type, size_bytes, r2_key, uploaded_by, uploaded_at "
-                    "FROM attachments WHERE id = %s",
+                    "SELECT a.id, a.ticket_id, a.file_name, a.mime_type, a.size_bytes, a.r2_key, a.uploaded_by, a.uploaded_at, t.created_by "
+                    "FROM attachments a JOIN tickets t ON a.ticket_id = t.id WHERE a.id = %s",
                     (attachment_id,),
                 )
                 row = await cur.fetchone()
                 if row is None:
+                    return {"message": "not found", "_reminder": reminder}
+
+                ticket_creator = row[8]
+                is_staff = role is not None and role in ("admin", "staff")
+                if not is_staff and ticket_creator != sub:
                     return {"message": "not found", "_reminder": reminder}
 
         file_data = await _read_file(row[5])

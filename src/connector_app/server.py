@@ -138,12 +138,12 @@ async def begin_session() -> dict:
 
 @mcp.tool
 async def domain_get_ticket(id: str, session_token: str) -> dict:
-    """Retrieve a support ticket by ID from the tickets table."""
+    """Retrieve a support ticket by ID. Non-staff users can only see their own tickets."""
     sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
     pool = await get_pool()
-    return await domain_tools.get_ticket(pool, sub, id, _REMINDER)
+    return await domain_tools.get_ticket(pool, sub, id, _REMINDER, role=role)
 
 
 @mcp.tool
@@ -167,13 +167,13 @@ async def domain_get_policy(id: str, session_token: str) -> dict:
 
 
 @mcp.tool
-async def domain_search(query: str, session_token: str) -> dict:
-    """Semantic search across orders and policies. Returns ranked results by meaning."""
+async def domain_search(query: str, session_token: str, include_my_tickets: bool = False) -> dict:
+    """Semantic search across orders, policies, and optionally your own tickets. Returns ranked results by meaning."""
     sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
     pool = await get_pool()
-    return await domain_tools.search(pool, sub, query, _REMINDER)
+    return await domain_tools.search(pool, sub, query, _REMINDER, include_my_tickets=include_my_tickets)
 
 
 @mcp.tool
@@ -315,7 +315,7 @@ async def domain_get_attachment(attachment_id: str, session_token: str) -> dict:
     if err is not None:
         return err
     pool = await get_pool()
-    return await domain_tools.get_attachment(pool, sub, attachment_id, _REMINDER)
+    return await domain_tools.get_attachment(pool, sub, attachment_id, _REMINDER, role=role)
 
 
 @mcp.tool
