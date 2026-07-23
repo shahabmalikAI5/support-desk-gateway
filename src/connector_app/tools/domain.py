@@ -849,7 +849,7 @@ async def agent_performance(pool, sub: str, role: str, agent: str, reminder: str
                 await cur.execute(
                     "SELECT COUNT(*) FROM tickets WHERE LOWER(assigned_to) = %s "
                     "AND id IN (SELECT DISTINCT ticket_id FROM ticket_notes WHERE note_type = 'system_event' "
-                    "AND body ILIKE '%escalation%')" + time_filter,
+                    "AND body ILIKE '%%escalation%%')" + time_filter,
                     [agent_norm] + time_params,
                 )
                 escalations = (await cur.fetchone())[0]

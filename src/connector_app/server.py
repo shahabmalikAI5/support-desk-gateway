@@ -5,7 +5,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-load_dotenv()
+load_dotenv(override=False)
 
 import uvicorn
 from fastmcp import FastMCP
@@ -506,8 +506,8 @@ _sync_task = None
 async def _combined_lifespan(app_):
     global _sync_task
     async with mcp_app.lifespan(app_):
-        from connector_app import sync
         try:
+            from connector_app import sync
             pool = await get_pool()
             _sync_task = sync.start_background_sync(pool)
         except Exception:
@@ -522,7 +522,7 @@ async def _combined_lifespan(app_):
 
 # ── Starlette deployment ──────────────────────────────────────────────────────
 
-mcp_app = mcp.http_app(path="/mcp", stateless_http=True)
+mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
 
 _routes: list = []
 
