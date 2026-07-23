@@ -41,12 +41,12 @@ def _get_sub() -> str:
     return os.environ.get("DEV_SUB", "dev-user-001")
 
 
-def _validate_session(session_token: str | None) -> tuple[str | None, dict | None]:
+def _validate_session(session_token: str | None) -> tuple[str | None, str | None, dict | None]:
     try:
-        sub = session.require_session(session_token)
-        return sub, None
+        sub, role = session.require_session(session_token)
+        return sub, role, None
     except session.SessionError as e:
-        return None, {"error": str(e), "_reminder": _REMINDER}
+        return None, None, {"error": str(e), "_reminder": _REMINDER}
 
 
 async def _log_audit(pool, user_id: str, tool_name: str, input_summary: str, output_summary: str) -> None:
@@ -147,7 +147,7 @@ async def begin_session() -> dict:
 @mcp.tool
 async def domain_get_ticket(id: str, session_token: str) -> dict:
     """Retrieve a support ticket by ID from the tickets table."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 
@@ -156,7 +156,8 @@ async def domain_get_ticket(id: str, session_token: str) -> dict:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT id, subject, body, priority, status, created_by, created_at FROM tickets WHERE id = %s",
+                    "SELECT id, subject, body, priority, status, created_by, created_at, assigned_to, updated_at, category "
+                    "FROM tickets WHERE id = %s",
                     (id,),
                 )
                 row = await cur.fetchone()
@@ -172,6 +173,9 @@ async def domain_get_ticket(id: str, session_token: str) -> dict:
                     "status": row[4],
                     "created_by": row[5],
                     "created_at": row[6].isoformat() if row[6] else None,
+                    "assigned_to": row[7],
+                    "updated_at": row[8].isoformat() if row[8] else None,
+                    "category": row[9],
                     "_reminder": _REMINDER,
                 }
     except Exception:
@@ -182,7 +186,7 @@ async def domain_get_ticket(id: str, session_token: str) -> dict:
 @mcp.tool
 async def domain_get_order(id: str, session_token: str) -> dict:
     """Retrieve an order by ID. Returns customer name, items, total, status, tracking."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 
@@ -208,7 +212,7 @@ async def domain_get_order(id: str, session_token: str) -> dict:
 @mcp.tool
 async def domain_get_policy(id: str, session_token: str) -> dict:
     """Retrieve a support or operational policy by ID."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 
@@ -234,7 +238,7 @@ async def domain_get_policy(id: str, session_token: str) -> dict:
 @mcp.tool
 async def domain_search(query: str, session_token: str) -> dict:
     """Semantic search across orders and policies. Returns ranked results by meaning."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 
@@ -289,7 +293,7 @@ async def domain_search(query: str, session_token: str) -> dict:
 @mcp.tool
 async def domain_create_ticket(subject: str, body: str, priority: str, session_token: str) -> dict:
     """Create a new support ticket on behalf of the current user."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 
@@ -331,7 +335,7 @@ async def domain_create_ticket(subject: str, body: str, priority: str, session_t
 @mcp.tool
 async def domain_list_my_tickets(session_token: str) -> dict:
     """List all tickets created by the current authenticated user."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 
@@ -363,7 +367,7 @@ async def domain_list_my_tickets(session_token: str) -> dict:
 @mcp.tool
 async def domain_get_customer_profile(session_token: str) -> dict:
     """Get the current user's support profile — metrics computed from ticket history."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 
@@ -438,7 +442,7 @@ async def domain_get_customer_profile(session_token: str) -> dict:
 @mcp.tool
 async def user_get_profile(session_token: str) -> dict:
     """Get the current user's saved preferences and state from their last session."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 
@@ -467,7 +471,7 @@ async def user_get_profile(session_token: str) -> dict:
 @mcp.tool
 async def user_save_state(state: dict, session_token: str) -> dict:
     """Save the current user's session state to persist across chats."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 
@@ -503,7 +507,7 @@ async def user_save_state(state: dict, session_token: str) -> dict:
 @mcp.tool
 async def config_get_rules(session_token: str) -> dict:
     """Read the current behavioral rules — escalation criteria, response guidelines, fail-closed instruction."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 
@@ -520,7 +524,7 @@ async def config_get_rules(session_token: str) -> dict:
 @mcp.tool
 async def config_get_persona(session_token: str) -> dict:
     """Read the current assistant persona and voice definition."""
-    sub, err = _validate_session(session_token)
+    sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
 

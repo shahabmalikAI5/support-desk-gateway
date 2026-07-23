@@ -84,16 +84,50 @@ def test_wrong_audience_is_rejected(make_token: Callable[..., str]) -> None:
 
 def test_identity_isolation(make_token: Callable[..., str]) -> None:
     # CROSS-USER ISOLATION: identity comes from the token's sub; A and B never cross.
-    a = session.require_session(
+    a_sub, a_role = session.require_session(
         session.new_session_token(auth.verified_claims(make_token("user-A"))["sub"])
     )
-    b = session.require_session(
+    b_sub, b_role = session.require_session(
         session.new_session_token(auth.verified_claims(make_token("user-B"))["sub"])
     )
-    assert a == "user-A" and b == "user-B" and a != b
+    assert a_sub == "user-A" and b_sub == "user-B" and a_sub != b_sub
+    assert a_role is None and b_role is None
 
 
 def test_no_session_is_refused() -> None:
     # FAIL CLOSED: a call with no session token is rejected.
     with pytest.raises(session.SessionError):
         session.require_session("")
+
+
+def test_require_role_gates_access(make_token: Callable[..., str]) -> None:
+    # A token with no role should be denied by require_role for any specific role
+    sub = auth.verified_claims(make_token("user-A"))["sub"]
+    token_no_role = session.new_session_token(sub)
+    assert session.require_role(token_no_role, ["admin"]) is None
+    assert session.require_role(token_no_role, ["staff"]) is None
+
+    # A token with a role should be allowed for that role
+    token_admin = session.new_session_token(sub, role="admin")
+    assert session.require_role(token_admin, ["admin"]) == "user-A"
+    assert session.require_role(token_admin, ["staff"]) is None
+
+    token_staff = session.new_session_token(sub, role="staff")
+    assert session.require_role(token_staff, ["admin", "staff"]) == "user-A"
+    assert session.require_role(token_staff, ["admin"]) is None
+
+
+def test_role_is_none_by_default(make_token: Callable[..., str]) -> None:
+    # Backward compat: existing session tokens have no role claim
+    sub = auth.verified_claims(make_token("user-bob"))["sub"]
+    token = session.new_session_token(sub)
+    _, role = session.require_session(token)
+    assert role is None
+
+
+def test_role_is_stored_in_token(make_token: Callable[..., str]) -> None:
+    # A role claim should be preserved in the session token
+    sub = auth.verified_claims(make_token("user-alice"))["sub"]
+    token = session.new_session_token(sub, role="admin")
+    _, role = session.require_session(token)
+    assert role == "admin"

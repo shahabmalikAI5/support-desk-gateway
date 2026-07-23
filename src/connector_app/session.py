@@ -25,17 +25,18 @@ class SessionError(Exception):
     """Raised when a session token is missing, expired, or invalid. Caller fails closed."""
 
 
-def new_session_token(sub: str) -> str:
+def new_session_token(sub: str, role: str | None = None) -> str:
     now = int(time.time())
-    return jwt.encode(
-        {"sub": sub, "iat": now, "exp": now + _TTL_SECONDS, "scope": "session"},
-        _SECRET,
-        algorithm="HS256",
-    )
+    payload: dict[str, Any] = {
+        "sub": sub, "iat": now, "exp": now + _TTL_SECONDS, "scope": "session",
+    }
+    if role is not None:
+        payload["role"] = role
+    return jwt.encode(payload, _SECRET, algorithm="HS256")
 
 
-def require_session(token: str | None) -> str:
-    """Return the sub if the session token is valid; raise SessionError otherwise."""
+def require_session(token: str | None) -> tuple[str, str | None]:
+    """Return (sub, role) if the session token is valid; raise SessionError otherwise."""
     if not token:
         raise SessionError("no session — call begin_session first")
     try:
@@ -44,4 +45,13 @@ def require_session(token: str | None) -> str:
         raise SessionError(f"invalid session: {e}") from e
     if claims.get("scope") != "session":
         raise SessionError("wrong token type")
-    return claims["sub"]
+    return claims["sub"], claims.get("role")
+
+
+def require_role(token: str | None, allowed_roles: list[str]) -> str | None:
+    """Check session + role gate. Returns sub if allowed, None if role denied.
+    Raises SessionError if the session itself is invalid."""
+    sub, role = require_session(token)
+    if role is None or role not in allowed_roles:
+        return None
+    return sub
