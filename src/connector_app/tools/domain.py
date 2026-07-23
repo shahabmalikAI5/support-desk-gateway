@@ -3,6 +3,8 @@
 import os
 import uuid
 from datetime import datetime, timezone
+
+import httpx
 from psycopg.types.json import Jsonb
 
 
@@ -15,7 +17,6 @@ async def _get_embedding(text: str) -> list[float] | None:
     if not api_key or not text:
         return None
     try:
-        import httpx
         async with httpx.AsyncClient() as client:
             resp = await client.post(
                 "https://api.mistral.ai/v1/embeddings",
@@ -109,7 +110,6 @@ async def get_order(pool, sub: str, id: str, reminder: str) -> dict:
         if not shop_token or not shop_domain:
             return {"message": "not found", "_reminder": reminder}
 
-        import httpx
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 f"https://{shop_domain}/admin/api/2024-07/orders/{id}.json",
@@ -1063,7 +1063,6 @@ async def _fd_creds(pool) -> tuple[str | None, str | None]:
 
 async def _fd_request(method: str, path: str, api_key: str, domain: str, json_body: dict | None = None) -> dict | None:
     """Make a Freshdesk API request. Returns parsed JSON or None on failure."""
-    import httpx
     auth = httpx.BasicAuth(api_key, "X")
     url = f"https://{domain}.freshdesk.com/api/v2{path}"
     try:
@@ -1072,6 +1071,8 @@ async def _fd_request(method: str, path: str, api_key: str, domain: str, json_bo
             if resp.status_code in (200, 201):
                 return resp.json()
             return None
+    except Exception:
+        return None
     except Exception:
         return None
 
@@ -1104,9 +1105,11 @@ async def sync_to_freshdesk(pool, sub: str, role: str, ticket_id: str, action: s
                 if action in ("push", "sync_bi"):
                     fd_status = _FD_STATUS_MAP.get(status, 2)
                     fd_priority = _FD_PRIORITY_MAP.get(priority, 2)
+                    requester_email = creator if "@" in creator else f"{creator}@connector.app"
                     payload = {
                         "subject": f"[{tid}] {subject}",
                         "description": body or "",
+                        "email": requester_email,
                         "status": fd_status,
                         "priority": fd_priority,
                     }
