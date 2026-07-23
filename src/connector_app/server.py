@@ -177,13 +177,13 @@ async def domain_search(query: str, session_token: str, include_my_tickets: bool
 
 
 @mcp.tool
-async def domain_create_ticket(subject: str, body: str, priority: str, session_token: str) -> dict:
-    """Create a new support ticket on behalf of the current user."""
+async def domain_create_ticket(subject: str, body: str, priority: str, session_token: str, category: str = "other") -> dict:
+    """Create a new support ticket. Category: billing, returns, technical, account, shipping, other (default)."""
     sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
     pool = await get_pool()
-    return await domain_tools.create_ticket(pool, sub, subject, body, priority, _REMINDER)
+    return await domain_tools.create_ticket(pool, sub, subject, body, priority, _REMINDER, category=category)
 
 
 @mcp.tool
@@ -207,13 +207,13 @@ async def domain_get_customer_profile(session_token: str) -> dict:
 
 
 @mcp.tool
-async def domain_assign_ticket(ticket_id: str, assigned_to: str, session_token: str) -> dict:
+async def domain_assign_ticket(ticket_id: str, agent: str, session_token: str) -> dict:
     """Assign a ticket to a support agent. Sets status to in_progress if currently open."""
     sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
     pool = await get_pool()
-    return await domain_tools.assign_ticket(pool, sub, role, ticket_id, assigned_to, _REMINDER)
+    return await domain_tools.assign_ticket(pool, sub, role, ticket_id, agent, _REMINDER)
 
 
 @mcp.tool

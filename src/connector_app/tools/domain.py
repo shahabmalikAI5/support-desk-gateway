@@ -62,6 +62,15 @@ async def get_ticket(pool, sub: str, id: str, reminder: str, *, role: str | None
                 elif ticket_creator != sub:
                     return {"message": "not found", "_reminder": reminder}
 
+                await cur.execute(
+                    "SELECT COUNT(*), COALESCE(array_agg(id ORDER BY id), '{}') "
+                    "FROM attachments WHERE ticket_id = %s",
+                    (id,),
+                )
+                att_row = await cur.fetchone()
+                att_count = att_row[0] if att_row else 0
+                att_ids = att_row[1] if att_row and att_row[1] else []
+
                 await log_audit(pool, sub, "domain_get_ticket", f"id={id}", f"found ticket {id}")
                 return {
                     "id": row[0], "subject": row[1], "body": row[2],
@@ -70,6 +79,8 @@ async def get_ticket(pool, sub: str, id: str, reminder: str, *, role: str | None
                     "assigned_to": row[7],
                     "updated_at": row[8].isoformat() if row[8] else None,
                     "category": row[9],
+                    "attachment_count": att_count,
+                    "attachment_ids": att_ids,
                     "_reminder": reminder,
                 }
     except Exception:
@@ -165,7 +176,7 @@ async def search(pool, sub: str, query: str, reminder: str, *, include_my_ticket
         return {"error": "Search temporarily unavailable.", "_reminder": reminder}
 
 
-async def create_ticket(pool, sub: str, subject: str, body: str, priority: str, reminder: str) -> dict:
+async def create_ticket(pool, sub: str, subject: str, body: str, priority: str, reminder: str, *, category: str = "other") -> dict:
     if not subject or not subject.strip():
         return {"error": "subject is required", "_reminder": reminder}
     if len(subject) > 500:
@@ -176,15 +187,18 @@ async def create_ticket(pool, sub: str, subject: str, body: str, priority: str, 
         return {"error": "body exceeds 5000 characters", "_reminder": reminder}
     if priority not in ("low", "medium", "high", "critical"):
         return {"error": "priority must be one of: low, medium, high, critical", "_reminder": reminder}
+    valid_categories = {"billing", "returns", "technical", "account", "shipping", "other"}
+    if category not in valid_categories:
+        return {"error": "category must be one of: billing, returns, technical, account, shipping, other", "_reminder": reminder}
 
     try:
         ticket_id = f"tkt-{uuid.uuid4().hex[:6]}"
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "INSERT INTO tickets (id, subject, body, priority, status, created_by) "
-                    "VALUES (%s, %s, %s, %s, 'open', %s) RETURNING created_at",
-                    (ticket_id, subject.strip(), body.strip(), priority, sub),
+                    "INSERT INTO tickets (id, subject, body, priority, status, created_by, category) "
+                    "VALUES (%s, %s, %s, %s, 'open', %s, %s) RETURNING created_at",
+                    (ticket_id, subject.strip(), body.strip(), priority, sub, category),
                 )
                 row = await cur.fetchone()
 
@@ -278,12 +292,33 @@ async def get_customer_profile(pool, sub: str, reminder: str) -> dict:
                 last_row = await cur.fetchone()
                 last_contact = last_row[0].isoformat() if last_row and last_row[0] is not None else None
 
+                await cur.execute(
+                    "SELECT csat_score FROM tickets WHERE created_by = %s "
+                    "AND csat_score IS NOT NULL ORDER BY csat_submitted_at DESC LIMIT 5",
+                    (sub,),
+                )
+                csat_scores = [r[0] for r in await cur.fetchall()]
+                csat_trend: str | None = None
+                if len(csat_scores) >= 3:
+                    trend_sum = sum(
+                        csat_scores[i] - csat_scores[i + 1]
+                        for i in range(len(csat_scores) - 1)
+                    )
+                    if trend_sum > 0:
+                        csat_trend = "improving"
+                    elif trend_sum < 0:
+                        csat_trend = "declining"
+                    else:
+                        csat_trend = "stable"
+                elif len(csat_scores) > 0:
+                    csat_trend = "stable"
+
         await log_audit(pool, sub, "domain_get_customer_profile", "", f"open={open_tickets} total={total_tickets}")
         return {
             "open_tickets": open_tickets, "total_tickets": total_tickets,
             "avg_resolution_time_hours": avg_hours, "csat_score": csat,
             "sla_breaches": sla_breaches, "account_age_days": account_age,
-            "last_contact_at": last_contact,
+            "last_contact_at": last_contact, "csat_trend": csat_trend,
             "_reminder": reminder,
         }
     except Exception:
@@ -309,27 +344,52 @@ def validate_transition(current: str, new_status: str) -> bool:
 
 # ── v2 / v3 ticket management tools ─────────────────────────────────────────
 
-async def assign_ticket(pool, sub: str, role: str, ticket_id: str, assignee: str, reminder: str) -> dict:
+async def assign_ticket(pool, sub: str, role: str, ticket_id: str, agent: str, reminder: str) -> dict:
     allowed_roles = ["admin", "staff"]
     if role is None or role not in allowed_roles:
         return {"message": "not found", "_reminder": reminder}
+    if not agent or not agent.strip():
+        return {"error": "agent is required", "_reminder": reminder}
+    agent_normalized = agent.strip()
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT status FROM tickets WHERE id = %s", (ticket_id,))
+                await cur.execute(
+                    "SELECT status, assigned_to FROM tickets WHERE id = %s FOR UPDATE",
+                    (ticket_id,),
+                )
                 row = await cur.fetchone()
                 if row is None:
                     return {"message": "not found", "_reminder": reminder}
                 current_status = row[0]
+                current_assigned = row[1]
+                if current_status in ("resolved", "closed"):
+                    return {"error": "ticket is already resolved — cannot reassign", "_reminder": reminder}
+                if current_assigned and current_assigned.strip().lower() == agent_normalized.lower():
+                    return {
+                        "status": "assigned", "assigned_to": current_assigned,
+                        "ticket_status": current_status, "note": "already assigned to this agent",
+                        "_reminder": reminder,
+                    }
                 new_status = "in_progress" if current_status == "open" else current_status
                 now_ts = _now_iso()
                 await cur.execute(
                     "UPDATE tickets SET assigned_to = %s, assigned_at = %s, status = %s, updated_at = %s, last_activity_at = %s "
                     "WHERE id = %s",
-                    (assignee, now_ts, new_status, now_ts, now_ts, ticket_id),
+                    (agent_normalized, now_ts, new_status, now_ts, now_ts, ticket_id),
                 )
-        await log_audit(pool, sub, "domain_assign_ticket", f"ticket={ticket_id},assignee={assignee}", "assigned")
-        return {"status": "assigned", "assigned_to": assignee, "ticket_status": new_status, "_reminder": reminder}
+                await cur.execute(
+                    "INSERT INTO ticket_notes (ticket_id, author_sub, author_role, body, note_type) "
+                    "VALUES (%s, %s, %s, %s, 'system_event')",
+                    (ticket_id, sub, role or "staff",
+                     f"Ticket assigned to {agent_normalized} (status: {current_status} → {new_status})"),
+                )
+        await log_audit(pool, sub, "domain_assign_ticket", f"ticket={ticket_id},agent={agent_normalized}", "assigned")
+        return {
+            "ticket_id": ticket_id, "assigned_to": agent_normalized,
+            "status": new_status, "assigned_at": _now_iso(),
+            "_reminder": reminder,
+        }
     except Exception:
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
@@ -424,12 +484,23 @@ async def submit_csat(pool, sub: str, ticket_id: str, score: int, reminder: str)
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT id, status, created_by FROM tickets WHERE id = %s", (ticket_id,))
+                await cur.execute(
+                    "SELECT id, status, created_by, csat_score, csat_submitted_at FROM tickets WHERE id = %s FOR UPDATE",
+                    (ticket_id,),
+                )
                 row = await cur.fetchone()
                 if row is None:
                     return {"message": "not found", "_reminder": reminder}
                 if row[2] != sub:
                     return {"message": "not found", "_reminder": reminder}
+                if row[1] != "resolved":
+                    return {"error": "ticket must be resolved before rating", "_reminder": reminder}
+                if row[3] is not None:
+                    orig_ts = row[4].isoformat() if row[4] else None
+                    return {
+                        "csat_score": int(row[3]), "already_rated": True,
+                        "submitted_at": orig_ts, "_reminder": reminder,
+                    }
                 now_ts = _now_iso()
                 await cur.execute(
                     "UPDATE tickets SET csat_score = %s, csat_submitted_at = %s, updated_at = %s, last_activity_at = %s "
@@ -437,7 +508,7 @@ async def submit_csat(pool, sub: str, ticket_id: str, score: int, reminder: str)
                     (score, now_ts, now_ts, now_ts, ticket_id),
                 )
         await log_audit(pool, sub, "domain_submit_csat", f"ticket={ticket_id},score={score}", "submitted")
-        return {"status": "submitted", "score": score, "_reminder": reminder}
+        return {"status": "submitted", "csat_score": score, "_reminder": reminder}
     except Exception:
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
