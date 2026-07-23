@@ -299,13 +299,13 @@ async def domain_get_audit_log(session_token: str,
 
 
 @mcp.tool
-async def domain_attach_file(ticket_id: str, file_name: str, file_data: str, session_token: str) -> dict:
-    """Attach a file to a ticket. file_data is base64-encoded content."""
+async def domain_attach_file(ticket_id: str, file_name: str, file_data: str, mime_type: str, session_token: str) -> dict:
+    """Attach a file to a ticket. file_data is base64-encoded content, mime_type must be image/jpeg, image/png, image/gif, application/pdf, text/plain, or text/csv. Max 10MB, max 10 per ticket."""
     sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
     pool = await get_pool()
-    return await domain_tools.attach_file(pool, sub, role, ticket_id, file_name, file_data, _REMINDER)
+    return await domain_tools.attach_file(pool, sub, role, ticket_id, file_name, file_data, mime_type, _REMINDER)
 
 
 @mcp.tool

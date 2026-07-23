@@ -54,8 +54,12 @@ async def get_ticket(pool, sub: str, id: str, reminder: str, *, role: str | None
                     return {"message": "not found", "_reminder": reminder}
 
                 ticket_creator = row[5]
+                ticket_assigned = row[7]
                 is_staff = role is not None and role in ("admin", "staff")
-                if not is_staff and ticket_creator != sub:
+                if is_staff:
+                    if ticket_creator != sub and ticket_assigned != sub:
+                        return {"message": "not found", "_reminder": reminder}
+                elif ticket_creator != sub:
                     return {"message": "not found", "_reminder": reminder}
 
                 await log_audit(pool, sub, "domain_get_ticket", f"id={id}", f"found ticket {id}")
@@ -608,26 +612,59 @@ async def get_audit_log(pool, sub: str, role: str, reminder: str, *,
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
 
-async def attach_file(pool, sub: str, role: str, ticket_id: str, file_name: str, file_data: str, reminder: str) -> dict:
-    allowed_roles = ["admin", "staff"]
-    if role is None or role not in allowed_roles:
-        return {"message": "not found", "_reminder": reminder}
+async def attach_file(pool, sub: str, role: str, ticket_id: str, file_name: str, file_data: str, mime_type: str, reminder: str) -> dict:
     try:
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT id FROM tickets WHERE id = %s", (ticket_id,))
-                if await cur.fetchone() is None:
+                await cur.execute(
+                    "SELECT id, created_by, assigned_to FROM tickets WHERE id = %s",
+                    (ticket_id,),
+                )
+                row = await cur.fetchone()
+                if row is None:
                     return {"message": "not found", "_reminder": reminder}
 
-        r2_key = f"{ticket_id}/{uuid.uuid4().hex[:8]}-{file_name}"
-        await _store_file(r2_key, file_data)
-        attachment_id = f"att-{uuid.uuid4().hex[:8]}"
+                ticket_creator = row[1]
+                ticket_assigned = row[2]
+                is_staff = role is not None and role in ("admin", "staff")
+                if is_staff:
+                    if ticket_creator != sub and ticket_assigned != sub:
+                        return {"message": "not found", "_reminder": reminder}
+                elif ticket_creator != sub:
+                    return {"message": "not found", "_reminder": reminder}
+
+        import base64
+        try:
+            raw_bytes = base64.b64decode(file_data)
+        except Exception:
+            return {"error": "file data is not valid base64", "_reminder": reminder}
+
+        if len(raw_bytes) > 10 * 1024 * 1024:
+            return {"error": "file exceeds 10MB limit", "_reminder": reminder}
+
+        allowed_mimes = {"image/jpeg", "image/png", "image/gif", "application/pdf", "text/plain", "text/csv"}
+        if mime_type not in allowed_mimes:
+            return {"error": f"unsupported file type: {mime_type}", "_reminder": reminder}
 
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                import base64
-                size_bytes = len(base64.b64decode(file_data)) if file_data else 0
-                mime_type = _guess_mime(file_name)
+                await cur.execute(
+                    "SELECT COUNT(*) FROM attachments WHERE ticket_id = %s", (ticket_id,)
+                )
+                count = (await cur.fetchone())[0]
+                if count >= 10:
+                    return {"error": "ticket already has 10 attachments", "_reminder": reminder}
+
+        r2_key = f"{ticket_id}/{uuid.uuid4().hex[:8]}-{file_name}"
+        try:
+            await _store_file(r2_key, base64.b64encode(raw_bytes).decode())
+        except Exception:
+            return {"error": "I cannot access the support system right now.", "_reminder": reminder}
+
+        attachment_id = f"att-{uuid.uuid4().hex[:8]}"
+        size_bytes = len(raw_bytes)
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
                 await cur.execute(
                     "INSERT INTO attachments (id, ticket_id, file_name, mime_type, size_bytes, r2_key, uploaded_by) "
                     "VALUES (%s, %s, %s, %s, %s, %s, %s)",
@@ -635,7 +672,7 @@ async def attach_file(pool, sub: str, role: str, ticket_id: str, file_name: str,
                 )
 
         await log_audit(pool, sub, "domain_attach_file", f"ticket={ticket_id},file={file_name}", f"attached {attachment_id}")
-        return {"attachment_id": attachment_id, "file_name": file_name, "_reminder": reminder}
+        return {"attachment_id": attachment_id, "file_name": file_name, "size_bytes": size_bytes, "_reminder": reminder}
     except Exception:
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
@@ -645,7 +682,7 @@ async def get_attachment(pool, sub: str, attachment_id: str, reminder: str, *, r
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT a.id, a.ticket_id, a.file_name, a.mime_type, a.size_bytes, a.r2_key, a.uploaded_by, a.uploaded_at, t.created_by "
+                    "SELECT a.id, a.ticket_id, a.file_name, a.mime_type, a.size_bytes, a.r2_key, a.uploaded_by, a.uploaded_at, t.created_by, t.assigned_to "
                     "FROM attachments a JOIN tickets t ON a.ticket_id = t.id WHERE a.id = %s",
                     (attachment_id,),
                 )
@@ -654,8 +691,12 @@ async def get_attachment(pool, sub: str, attachment_id: str, reminder: str, *, r
                     return {"message": "not found", "_reminder": reminder}
 
                 ticket_creator = row[8]
+                ticket_assigned = row[9]
                 is_staff = role is not None and role in ("admin", "staff")
-                if not is_staff and ticket_creator != sub:
+                if is_staff:
+                    if ticket_creator != sub and ticket_assigned != sub:
+                        return {"message": "not found", "_reminder": reminder}
+                elif ticket_creator != sub:
                     return {"message": "not found", "_reminder": reminder}
 
         file_data = await _read_file(row[5])
