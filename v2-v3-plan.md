@@ -1,217 +1,633 @@
-# Technical Plan: v2 + v3 Implementation
+# Technical Plan: v2 + v3 Full Spec Implementation
 
-## 1. Stack (no new frameworks)
+## Status
+
+v1 is complete. v2/v3 code was partially implemented from an earlier draft of this plan.
+This document supersedes that work and defines the **full v2-v3-spec.md compliance build**.
+Every gap identified by the gap analysis is addressed below.
+
+**56 gaps identified (28 HIGH, 19 MEDIUM, 9 LOW).** All are covered in the phases below.
+
+---
+
+## 1. Stack
 
 | Layer | Choice | Rationale |
 |-------|--------|-----------|
 | Framework | FastMCP + Starlette | Unchanged from v1 |
-| Auth | DescopeProvider + session.py | Unchanged; extended with `role` claim |
-| DB | Neon PostgreSQL + psycopg async | Unchanged; new tables, column migrations |
+| Auth | DescopeProvider + session.py | Unchanged; role claim already implemented |
+| DB | Neon PostgreSQL + psycopg async | Unchanged; 6 tables exist, `ticket_notes` needs creation |
 | Embeddings | Mistral API + httpx | Unchanged |
-| Attachments | Cloudflare R2 via **boto3** (`pip install boto3`) | The single new dep; S3-compatible presigned URLs are non-trivial to hand-roll |
-| Email | **Raw httpx** to SendGrid REST API | No SDK needed — one POST endpoint, avoid extra dep |
-| External APIs | Raw httpx (Freshdesk, Shopify) | Reuses existing pattern from `domain_search` |
-| Admin dashboard | Single static HTML file, inline JS/CSS | No framework, no build step; served via `FileResponse` |
-| Background sync | asyncio `Task` in the same process | No separate service, no cron |
+| Attachments | Cloudflare R2 via **boto3** | Installed; R2 client needs wiring into domain.py |
+| Email | Raw httpx to SendGrid REST API | notifications.py exists but never called from tools |
+| External APIs | Raw httpx (Freshdesk, Shopify) | domain_sync_to_freshdesk needs real implementation |
+| Admin dashboard | Single static HTML file | admin/index.html exists; route path needs hardening |
+| Background sync | asyncio Task | sync.py exists; scope and credential reading need fixes |
+| Deployment | Dockerfile + fly.toml | **Missing** — must be created |
 
-## 2. Proposed File Structure
+---
+
+## 2. Full File Structure
 
 ```
 src/connector_app/
 ├── __init__.py
-├── auth.py              # GIVEN — wrapper added: `get_access_token_claims()` alongside it, never rewritten
-├── session.py           # GIVEN — extended: token carries `role` claim
-├── server.py            # FastMCP app, Starlette routes, ~all tool definitions
-├── db.py                # Pool + DDL migration helpers
-├── config_store.py      # Extended: set_rules, set_persona, restore_version, config_history
-├── tools/               # NEW — extracted tool implementations (no MCP registration here)
+├── auth.py              # GIVEN — never rewritten
+├── session.py           # GIVEN — role claim already implemented
+├── server.py            # FastMCP app, Starlette routes, all 34 tool registrations
+├── db.py                # Async Neon pool
+├── config_store.py      # get_rules, get_persona with fallbacks
+├── role_gate.py         # gate_admin/gate_staff helpers + TOOLS_LIST_FILTERING
+├── catalog.py           # Embedding pipeline for policies/orders
+├── notifications.py     # SendGrid + webhook dispatch (needs wiring)
+├── sync.py              # Background Freshdesk polling (needs fixes)
+├── tools/
 │   ├── __init__.py
-│   ├── domain.py        # get_ticket, get_order, get_policy, search, create_ticket,
-│   │                    # list_my_tickets, get_customer_profile,
-│   │                    # assign_ticket, reassign_ticket, update_ticket, submit_csat,
-│   │                    # attach_file, get_attachment, draft_reply,
-│   │                    # report_summary, agent_performance, get_audit_log,
-│   │                    # sync_to_freshdesk (v3)
-│   ├── user.py          # get_profile, save_state, configure_notifications (v3)
-│   └── config.py        # get_rules, get_persona, set_rules, set_persona,
-│                        # restore_version, set_freshdesk_creds, set_shopify_creds
-├── catalog.py           # NEW — catalog ops: set_policy, set_order, delete_item, list_all embedding pipeline
-├── notifications.py     # NEW — SendGrid + webhook dispatch (stateless functions)
-│                        # Imported by tools/domain.py (domain_update_ticket fires
-│                        # notifications synchronously on reply_body/reopen)
-├── sync.py              # NEW — background Freshdesk sync asyncio Task
-└── role_gate.py         # NEW — require_role() decorator/filter, tools/list role filtering
+│   ├── domain.py        # 18 domain_* implementations
+│   ├── user.py          # 3 user_* implementations
+│   └── config.py        # 7 config_* implementations
 admin/
-└── index.html           # NEW — single static admin dashboard
+└── index.html           # Static admin dashboard
+seed/
+├── tickets.json         # MISSING — 5 sample tickets
+├── attachments.json     # MISSING — 2 sample attachment rows
+└── notifications.json   # MISSING — 1 notification config row
+Dockerfile               # MISSING
+fly.toml                 # MISSING
 ```
 
-**Decision: Split tools vs. keep in server.py**
+---
 
-- **Option A (chosen):** Extract implementation to `tools/*.py`, keep `@mcp.tool` registration in `server.py`
-- **Trade-off:** Server.py stays the "table of contents" (~300 lines of registrations calling thin wrappers). `tools/domain.py` handles all DB logic (~800 lines). Avoids a 2500-line monolith but doesn't over-engineer — registration and logic are in exactly two layers, no complex DI.
-- **Alternative rejected:** Keep everything in server.py → 2000+ lines, unreadable for debugging.
+## 3. All Changes Required (by spec compliance)
 
-## 3. Key Decisions
+Spec references are to `v2-v3-spec.md` line numbers.
 
-### 3.1 Role gating: HMAC-embedded claim in session token
+### 3.1 Role Gating Matrix (spec lines 308–340)
 
-**Decision:** Extend `session.new_session_token(sub, role)` to include `role` as a claim. `require_session()` returns both `sub` and `role`. A new `require_role(session_token, allowed_roles)` function wraps role checks. For admin tools: `require_role(token, ["admin"])` → returns `"not found"` (not "unauthorized"). For agent tools: `require_role(token, ["admin", "staff"])`.
+| Tool | Current role gate | Spec requires | Fix |
+|------|------------------|---------------|-----|
+| `domain_agent_performance` | staff+ | admin-only | Tighten to admin |
+| `domain_report_summary` | staff+ | admin-only | Tighten to admin |
+| `catalog_list_all` | staff+ | admin-only | Tighten to admin |
+| `domain_get_ticket` | staff sees ALL tickets | staff sees own + assigned | Fix identity check |
+| `domain_get_attachment` | staff sees ALL attachments | staff sees own + assigned | Fix identity check |
+| `domain_attach_file` | staff+ only | customers can attach to own tickets | Allow customers |
 
-**Trade-off:** Embedding role in the session token means role changes take up to 30 min to propagate (session TTL). Accepted per spec: "role changes are not real-time." Not embedding it would require checking Descope on every tool call, adding ~50ms per call.
+### 3.2 tools/list Role Filtering (spec lines 1456–1461)
 
-**What changes where:**
-- `session.py` — `new_session_token(sub, role=None)` adds `role` claim
-- `session.py` — `require_session()` returns `tuple[str, str | None]` (sub, role)
-- `auth.py` — Add a `get_access_token_claims()` wrapper alongside the existing GIVEN code (don't rewrite it — the Connector-Native Apps course marks this file as GIVEN for a reason, but we need the full claims dict, not just `sub`). The wrapper calls the existing DescopeProvider, validates the token, and returns the full claims dictionary.
-- `server.py` — `_get_sub()` becomes `_get_claims()` returning `(sub, role)`
-- `begin_session()` embeds role in session token, returns `role` field
+The MCP `tools/list` response must exclude tools based on role:
+- **Customer (no role):** ~12 tools (health, begin_session, create_ticket, get_ticket, search,
+  get_policy, get_order, submit_csat, attach_file, get_attachment, get_customer_profile,
+  save_state, get_profile, configure_notifications)
+- **Staff (role="staff"):** ~18 tools (customer + assign, reassign, update_ticket, draft_reply,
+  get_audit_log, sync_to_freshdesk)
+- **Admin (role="admin"):** all ~28 customer tools + report_summary, agent_performance,
+  config_set_*, config_restore_version, catalog_set_*, catalog_delete_item, catalog_list_all,
+  config_set_freshdesk_creds, config_set_shopify_creds
 
-### 3.2 boto3 for R2 presigned URLs
+**Implementation:** Hook into `mcp.list_tools()` via `add_tool_transformation()` to filter.
 
-**Decision:** Add `boto3` as the single new dependency. R2 is S3-compatible; boto3 handles the presigned URL signing logic that is error-prone to reimplement.
+### 3.3 Multi-Tenant Identity Checks (spec lines 1463–1481)
 
-**Trade-off:** Adds a 40MB dependency (boto3 + botocore). Alternative is hand-rolling S3 sigv4 with raw httpx (~80 lines of crypto, high bug risk). boto3 is the standard tool for this job and the Docker image already has copious space.
+**`domain_get_ticket`** (domain.py lines 42–80):
+- Current: `if not is_staff and ticket_creator != sub → "not found"`
+- Required: `if is_staff → allow if created_by=sub OR assigned_to=sub. If customer → allow only if created_by=sub.`
 
-### 3.3 SendGrid: raw httpx, no SDK
+**`domain_get_attachment`** (domain.py lines 643–673):
+- Same pattern: join attachments→tickets, check `t.created_by = sub OR (is_staff AND t.assigned_to = sub)`
 
-**Decision:** POST to `https://api.sendgrid.com/v3/mail/send` with `Authorization: Bearer` header using raw httpx. One endpoint, one function, ~15 lines.
+### 3.4 `domain_get_ticket` Output — attachment fields (spec lines 1273–1284)
 
-**Trade-off:** No typing or helper classes from the SDK. But for a single-method API call with a 4-field JSON body, the SDK adds 3MB of deps for zero benefit beyond what we get from httpx. All error handling is identical (check status code, log on failure).
+Must always include:
+- `attachment_count` — COUNT query on attachments table
+- `attachment_ids` — list of IDs query on attachments table
+Add to the SELECT or as a second query.
 
-### 3.4 Admin dashboard: inline static HTML
+### 3.5 `domain_get_customer_profile` — csat_trend (spec lines 1286–1297)
 
-**Decision:** Single `admin/index.html` with inline CSS and JS. Served via `starlette.responses.FileResponse` at route `/admin` (GET only). No build step, no npm, no framework.
+Must return `csat_trend` field. Compute from last 5 rated tickets:
+- `"improving"` — last 5 scores show upward trend
+- `"declining"` — downward
+- `"stable"` — flat or <3 rated tickets
+- `null` — no rated tickets
 
-**Trade-off:** No TypeScript, no reactive framework, no component library. For a single-business-admin tool with ~5 textareas and a table, this is sufficient. If the admin needs grew to team-scale, this would be rewritten — but that's v4+ territory. The key win: zero build infrastructure, zero maintenance.
+### 3.6 `domain_create_ticket` — category param (spec line 400)
 
-### 3.5 Background Freshdesk sync: asyncio Task
+Add optional `category: str = 'other'` parameter.
+Validate against enum: billing, returns, technical, account, shipping, other.
+Store in the `category` column.
 
-**Decision:** On server startup `lifespan`, spawn an `asyncio.create_task()` that loops every 15 minutes, pulls Freshdesk status for synced tickets. Runs in the same Python process.
+### 3.7 `domain_assign_ticket` (spec lines 412–452)
 
-**Trade-off:** No resilience (if the server crashes, sync stops). But adding a separate worker/cron job doubles deployment complexity and cost. At free-tier scale with 15-minute polling, the simplicity trade-off is correct. The on-demand `domain_sync_to_freshdesk` tool is the fallback.
+Changes from current:
+- Rename param `assigned_to` → `agent`
+- Add resolved/closed rejection: `"ticket is already resolved — cannot reassign"`
+- Normalize agent name: `.strip().lower()`, case-insensitive comparison
+- Existing same-agent assignment → no change, no error
+- Add `SELECT ... FOR UPDATE` for concurrent assignment safety
+- Create ticket_notes row with `note_type='system_event'` on assignment
 
-### 3.6 Config history: append-only table
+### 3.8 `domain_reassign_ticket` (spec lines 454–480)
 
-**Decision:** Every `config_set_rules`/`config_set_persona` inserts a row into `config_history` *before* upserting the current value. `config_restore_version` reads from it and writes the restored value as a new current + new history row.
+Changes from current:
+- Rename param `new_assignee` → `new_agent`
+- Add optional `reason: str | None = None` param
+- Query `assigned_to` BEFORE update → include as `previous_agent` in output
+- Add `reassigned_at` timestamp to output
+- Create ticket_notes row with `note_type='system_event'` on reassignment
 
-**Trade-off:** No diffs, no branching, no rollback. Simple append-only. For rules and persona texts (typically < 5KB each), storing full copies is negligible in storage. Extracting diffs would add complexity with no user value for single-admin scenarios.
+### 3.9 `domain_update_ticket` (spec lines 482–533)
 
-### 3.7 Embedding tickets for semantic search (v3)
+Major changes:
+- Add `reply_body: str | None = None` param
+  → When provided, INSERT into `ticket_notes` with `note_type='reply'`
+  → Trigger `notifications.dispatch()` for the ticket creator
+- Add category validation: must be one of billing, returns, technical, account, shipping, other
+  → Reject with: `"category must be one of: billing, returns, technical, account, shipping, other"`
+- Reopen behavior (status="open" from resolved):
+  → Clear `resolved_at = NULL`
+  → Clear `csat_score = NULL`
+  → Clear `freshdesk_synced_at = NULL`
+- All params optional — calling with just `ticket_id` returns current state (no-op)
+- Use `SELECT ... FOR UPDATE` for concurrent safety
 
-**Decision:** `domain_create_ticket` calls Mistral API to generate an embedding of subject + body, stores it in `support_embeddings` with `entity_type="ticket"`. `domain_search` with `include_my_tickets=True` queries embeddings filtered by `created_by`.
+### 3.10 `domain_submit_csat` (spec lines 536–569)
 
-**Trade-off:** Adds ~500ms to ticket creation (Mistral API latency). Tickets without embeddings (Mistral temporarily down) are excluded from search but fully accessible by ID. This matches the catalog embedding behavior — degrade gracefully, never block.
+Changes from current:
+- **Resolved-only gate:** Reject if `status != 'resolved'`:
+  `"ticket must be resolved before rating"`
+- **Already-rated handling:** If `csat_score IS NOT NULL`:
+  Return `{"csat_score": existing, "already_rated": true, "submitted_at": original_ts}`
+  Do NOT overwrite.
+- Use `SELECT ... FOR UPDATE` on the ticket row
 
-### 3.8 Schema migrations
+### 3.11 `domain_attach_file` (spec lines 571–611)
 
-**Decision:** No migration framework. Agent applies DDL changes via Neon MCP tools (`run_sql`). Add columns with `DEFAULT` values to avoid table rewrites; add constraints with `NOT VALID` → validate later for zero-downtime.
+Rewrite from current:
+- **MIME type as required input param** (not guessed from filename)
+- **MIME allowlist:** Only accept: image/jpeg, image/png, image/gif, application/pdf,
+  text/plain, text/csv. Reject others: `"unsupported file type: {mime_type}"`
+- **10MB size limit:** Reject: `"file exceeds 10MB limit"`
+- **10-attachment limit:** Reject: `"ticket already has 10 attachments"`
+- **Base64 validation:** Catch `binascii.Error`: `"file data is not valid base64"`
+- **Customer access:** Customers can attach to own tickets. Staff+ to own + assigned.
+- **R2 storage:** Upload decoded bytes to R2 bucket. Store `r2_key` in DB.
+- On R2 upload failure: delete the DB row, return error (DB+R2 consistency)
 
-**Trade-off:** No rollback automation. But we're in development, not production — re-running seed data is the rollback plan. For production (future), Fly.io's `fly secrets` + backup would be the recovery path.
+### 3.12 `domain_get_attachment` (spec lines 613–663)
 
-## 4. Required Schema Changes
+Rewrite from current:
+- **Remove inline base64 return** — NEVER return file content inline
+- **R2 presigned URL:** Generate S3-compatible presigned GET URL with 15-min expiry
+- **Output fields:**
+  ```json
+  {
+    "attachment_id": "att-001",
+    "ticket_id": "tkt-004",
+    "file_name": "photo.jpg",
+    "mime_type": "image/jpeg",
+    "size_bytes": 245760,
+    "presigned_url": "https://<bucket>.r2.cloudflarestorage.com/...?X-Amz-Expires=900...",
+    "url_expires_at": "2026-07-24T10:15:00Z"
+  }
+  ```
+- **Identity check:** Join with tickets table. Staff → own + assigned. Customer → own only.
 
-| Table | Change | 
-|-------|--------|
-| `tickets` | Add: `category TEXT`, `assigned_at TIMESTAMPTZ`, `closed_at TIMESTAMPTZ`, `freshdesk_id TEXT`, `freshdesk_synced_at TIMESTAMPTZ`, `csat_submitted_at TIMESTAMPTZ`, `tags TEXT[]`, `updated_at TIMESTAMPTZ DEFAULT now()`, `last_activity_at TIMESTAMPTZ DEFAULT now()`, `source TEXT DEFAULT 'mcp'`. Extend status check constraint to include `'pending'` |
-| `config_history` | **New table**: `id SERIAL PK`, `key TEXT`, `value TEXT`, `version_index INTEGER`, `updated_by TEXT`, `updated_at TIMESTAMPTZ` |
-| `attachments` | **New table**: `id TEXT PK`, `ticket_id TEXT FK`, `file_name TEXT`, `mime_type TEXT`, `size_bytes INTEGER`, `r2_key TEXT`, `uploaded_by TEXT`, `uploaded_at TIMESTAMPTZ` |
-| `notification_config` | **New table**: `user_sub TEXT PK`, `email TEXT`, `webhook_url TEXT`, `events TEXT[]`, `created_at TIMESTAMPTZ`, `updated_at TIMESTAMPTZ` |
-| `ticket_notes` | **New table**: `id SERIAL PK`, `ticket_id TEXT FK`, `author_sub TEXT`, `author_role TEXT`, `body TEXT`, `note_type TEXT`, `created_at TIMESTAMPTZ` |
-| `support_embeddings` | No schema change. Tickets use existing `entity_type` + `content` columns. |
+### 3.13 `domain_draft_reply` (spec lines 665–708)
 
-## 5. New Environment Variables
+**Complete rewrite** from current fixed-text draft to structured context:
+- Query ticket details (subject, body, status, priority, assigned_to)
+- Look up matching policy: match keywords from ticket body against policy titles in
+  `support_embeddings WHERE entity_type='policy'`. Return first match's ID, title, and
+  body excerpt (first 300 chars).
+- Fetch customer history: count of previous tickets, avg CSAT
+- Return structured:
+  ```json
+  {
+    "ticket_id": "tkt-004",
+    "customer_name": "Priya",
+    "ticket_subject": "Damaged item...",
+    "ticket_body": "I received...",
+    "ticket_status": "in_progress",
+    "ticket_priority": "high",
+    "policy_id": "pol-001",
+    "policy_title": "Refund & Return Policy",
+    "policy_excerpt": "Customers may return defective items within 30 days...",
+    "customer_history": "2 previous tickets, CSAT avg 4.5",
+    "agent_name": "Ravi",
+    "recommended_action": "Offer full refund with prepaid return label per pol-001"
+  }
+  ```
+- If no agent: `agent_name: null`, `recommended_action`: "Assign an agent first..."
+- If empty body: `recommended_action`: "The ticket has no details yet..."
+- If first ticket: `customer_history: null`
+- If no policy match: `policy_id: null`, `policy_excerpt: null`
 
-| Var | Required | Purpose |
-|-----|----------|---------|
-| `SENDGRID_API_KEY` | v2 | Email notifications (free tier: 100/day) |
-| `R2_ACCESS_KEY_ID` | v2 | Attachment storage |
-| `R2_SECRET_ACCESS_KEY` | v2 | Attachment storage |
-| `R2_ENDPOINT` | v2 | R2 endpoint URL |
-| `R2_BUCKET` | v2 | R2 bucket name |
-| `FRESHDESK_API_KEY` | v3 | Freshdesk sync |
-| `FRESHDESK_DOMAIN` | v3 | Freshdesk domain |
-| `SHOPIFY_ACCESS_TOKEN` | v3 | Shopify live order lookup |
-| `SHOPIFY_STORE_DOMAIN` | v3 | Shopify store domain |
-| `WEBHOOK_SECRET` | v3 | HMAC signing for webhook notifications |
-| `DESCOPE_MANAGEMENT_API_KEY` | v2 (fallback) | Only if Descope plan lacks custom JWT claims |
-| `AUTH_ISSUER` | v1 | Documented for completeness — already set in v1 |
-| `AUTH_JWKS_URL` | v1 | Documented for completeness — already set in v1 |
-| `RESOURCE_URL` | v1 | Documented for completeness — already set in v1 |
+### 3.14 `domain_report_summary` (spec lines 711–769)
 
-## 6. Implementation Order
+Changes from current:
+- **Period values:** "today", "yesterday", "week" (7 days), "month" (30), "quarter" (90)
+  (NOT "daily", "weekly", "monthly")
+- **Admin-only** (NOT staff+)
+- **Add output fields:**
+  - `from` / `to` — computed period boundaries (ISO 8601 UTC)
+  - `avg_csat_score` — average of `csat_score` for tickets resolved within period
+  - `top_categories` — tickets grouped by `category`, ranked by count, at most 5
+  - `by_priority` — count of tickets per priority level
+- **SLA breaches:** Current-backlog metric: count of tickets STILL open at period end
+  past their SLA (critical > 1h, high > 4h, medium > 24h, low > 72h).
 
-The spec is large. I propose 3 phases within v2, then v3:
+### 3.15 `domain_agent_performance` (spec lines 773–809)
 
-**Phase 1: Foundation (schema + role gating)**
-1. Run DDL migrations on Neon (new columns, new tables)
-2. Extend `session.py` — `role` claim in tokens, `require_role()` function
-3. Extend `begin_session` — extract role from Descope JWT + fallback to Management API
-4. Add `role_gate.py` — decorator, tools/list filtering
-5. Update all existing tools to use new `require_session` signature
+Changes from current:
+- **Admin-only** (NOT staff+)
+- **Add optional `period` param** — same values as report_summary
+- **Add output fields:**
+  - `period` — the period string or "all_time"
+  - `avg_csat_score` — average CSAT for this agent's tickets
+  - `sla_breaches` — count of this agent's tickets that breached SLA
+  - `current_open_tickets` — tickets assigned to agent NOT resolved/closed
+  - `escalations_handled` — tickets reassigned TO this agent where reason contained "escalation"
+  - `resolution_rate` — already exists (rename to match spec if needed)
+- **Case-insensitive agent matching** — `.strip().lower()` on agent param
 
-**Phase 2: v2 Core Tools**
-6. `domain_assign_ticket`, `domain_reassign_ticket`, `domain_update_ticket`
-   - Implement `_validate_transition(current_status, new_status) -> bool` in `tools/domain.py`
-   - The helper encodes the allowed transition map from the spec's state machine diagram
-   - Used by all three tools: assign transitions `open→in_progress`, reassign checks status,
-     update_ticket validates arbitrary transitions
-7. `domain_submit_csat`, `domain_draft_reply`
-8. `domain_report_summary`, `domain_agent_performance`
-9. `domain_get_audit_log`
-10. Update `domain_get_ticket` (attachments), `domain_get_customer_profile` (csat_trend)
+### 3.16 `domain_get_audit_log` (spec lines 811–854)
 
-**Phase 3: v2 Admin + Catalog**
-11. `config_set_rules`, `config_set_persona` (with config_history)
-12. `config_restore_version`
-13. `catalog_set_policy`, `catalog_set_order`, `catalog_delete_item`, `catalog_list_all`
-14. `config_set_freshdesk_creds`, `config_set_shopify_creds`
-15. Admin dashboard HTML/JS page
-16. Seed `config_history` with current rules and persona as version_index=0
+Changes from current:
+- **Add `total_matching`** — COUNT(*) before LIMIT
+- **Add `returned`** — len(entries) in this response
+- **Add `id`** to each entry
+- **Max limit: 500** (currently 200)
+- Entry format:
+  ```json
+  {
+    "id": 1042,
+    "user_id": "user_abc",
+    "tool_name": "domain_get_ticket",
+    "input_summary": "id=tkt-004",
+    "output_summary": "found ticket tkt-004",
+    "created_at": "2026-07-24T09:15:00Z"
+  }
+  ```
 
-**Phase 4: v2 Attachments**
-17. `domain_attach_file`, `domain_get_attachment` (R2 + boto3)
-18. Seed attachments data
+### 3.17 `domain_sync_to_freshdesk` (spec lines 1303–1369)
 
-**Phase 5: v3 Integration**
-19. `user_configure_notifications` (SendGrid + webhook dispatch)
-20. `domain_sync_to_freshdesk` + background sync task
-    - **Bootstrap note:** Background sync only pulls existing `freshdesk_id` tickets. The first sync for any ticket requires a manual `domain_sync_to_freshdesk("push")` call. The background task will find zero tickets to sync until at least one manual push has occurred.
-21. Shopify live lookup in `domain_get_order`
-22. `domain_search` with `include_my_tickets`
-23. Multi-tenant hardening (identity checks on ticket/attachment access)
-24. Seed data for v3 tables
+**Complete rewrite** from current batch-sync to per-ticket:
+- **Input:** `ticket_id` (required), `action` (optional, default "push")
+  (NOT `mode`)
+- **Actions:** "push" (send to FD), "pull" (fetch from FD), "sync_bi" (both directions)
+- **Push mapping:**
+  - `subject` → FD `subject` (prefixed: `"[tkt-008] subject"`)
+  - `body` → FD `description`
+  - `status` → FD `status` (open→2, triaged→2, in_progress→3, pending→3, resolved→4, closed→5)
+  - `priority` → FD `priority` (critical→4, high→3, medium→2, low→1)
+- **Pull mapping:**
+  - FD status 2 (Open) → **ignored** (local is authoritative for open/triaged)
+  - FD status 3 → "pending", 4 → "resolved", 5 → "closed"
+  - FD priority: 4→critical, 3→high, 2→medium, 1→low
+- **Credentials:** Read from config store first, fall back to env vars
+- **Error handling:** FD API unreachable → graceful error, no crash
 
-**Phase ordering rationale:** Attachments (Phase 4) is placed after Admin tools (Phase 3) because the admin dashboard is needed for smoke-testing the catalog and config changes before adding the file-upload pipeline. The ordering is: make the desk work (Phases 1-2) → let admins configure it (Phase 3) → add file handling (Phase 4) → connect to outside platforms (Phase 5). Each phase is independently testable.
+### 3.18 `domain_get_order` — Shopify fallback (spec lines 1483–1495)
 
-**Role gating across phases:** After Phase 1 adds `role_gate.py`, every tool added in Phases 2-5 must be wrapped with the appropriate role check:
-- Agent tools (Phases 2, 4, 5): `require_role(token, ["admin", "staff"])`
-- Admin tools (Phase 3): `require_role(token, ["admin"])`
-- Customer tools: no role check (default — all authenticated users)
+Changes from current:
+- **Add `source` field** to output: "catalog" or "shopify"
+- **Shopify fallback:** If not found locally, query Shopify API:
+  `GET https://{store_domain}/admin/api/2024-07/orders/{order_id}.json`
+  with `X-Shopify-Access-Token` header
+- **Shopify down:** Return `{"error": "...", "source": "catalog_only"}` — do not crash
+- **No creds configured:** Skip Shopify lookup, local catalog only, no error
 
-## 7. Invariant Preservation Checklist
+### 3.19 `user_configure_notifications` (spec lines 1373–1413)
+
+Changes from current:
+- **Email validation:** Reject invalid format: `"email is not a valid email address"`
+- **Webhook URL validation:** Must start with `https://`. Reject: `"webhook URL must start with https://"`
+- **Event validation:** Valid: status_changed, agent_assigned, resolution, all.
+  Reject: `"unknown event: {name}. Valid events: status_changed, agent_assigned, resolution, all"`
+- **"all" expansion:** Expand to ["status_changed", "agent_assigned", "resolution"] before storage
+- **Read-mode:** If all params are None, only SELECT and return current config without UPSERT
+- **Default events:** ["status_changed"]
+
+### 3.20 Notification Dispatch Wiring (spec lines 1396–1410, 1624–1647)
+
+**`notifications.dispatch()` is never called from any tool. Must wire it:**
+- After `domain_update_ticket` with `reply_body` or `status` change
+- After `domain_assign_ticket` (event: "agent_assigned")
+- Only dispatches for the ticket's `created_by` user (not any user with matching config)
+- `dispatch()` reads `notification_config` WHERE `user_sub = created_by` AND event matches
+- Email via SendGrid API; webhook POST with `X-Webhook-Signature` header
+- Fix header name: `X-Webhook-Signature` (NOT `X-Support-Desk-Signature`)
+- Fire-and-forget: failure logged, ticket update proceeds
+
+### 3.21 Background Sync Fixes (spec lines 1900–1916)
+
+Changes from current:
+- Query tickets with `freshdesk_id IS NOT NULL` AND `status IN ('open', 'in_progress')`
+  (currently queries ALL statuses)
+- Read Freshdesk creds from config store first, env vars as fallback
+- Ignore FD Status 2 on pull (local is authoritative for open/triaged)
+- Each ticket sync is independent (error on one doesn't block others)
+
+### 3.22 Config Tools (spec lines 858–1178)
+
+**`config_set_rules`** (spec lines 865–892):
+- Add empty-text validation: `"rules text is required"`
+- Add max length: 10000 chars
+- Output format: `{"status": "updated", "key": "rules", "updated_at": "..."}`
+
+**`config_set_persona`** (spec lines 896–914):
+- Same pattern: empty-text validation, max 5000 chars, correct output format
+
+**`config_restore_version`** (spec lines 1069–1106):
+- version_index=0 → rejected: `"version_index 0 is the current version — cannot restore to itself"`
+- Version exceeds history → clear error with latest available version
+- Key never edited → `"no previous versions available for key '{key}'"`
+- Invalid key → `"key must be 'rules' or 'persona'"`
+
+**`config_set_freshdesk_creds`** (spec lines 1109–1141):
+- Actually store in config table (NOT just log audit and say "restart required")
+- Take effect immediately (background sync reads from config table)
+- Audit log: mask API key — log only first 4 chars: `"key=abcd..."`
+- Validation: empty domain/api_key → rejected
+- Output: `{"platform": "freshdesk", "status": "configured", "updated_at": "..."}`
+
+**`config_set_shopify_creds`** (spec lines 1144–1177):
+- Same pattern as freshdesk: actual storage, immediate effect, token mask in audit
+- Audit: `"token=****"` (never include the actual token)
+
+### 3.23 Catalog Tools (spec lines 918–1065)
+
+**`catalog_set_policy`** (spec lines 918–959):
+- Return `embedding_regenerated: true/false` (NOT `embedded`)
+- When Mistral down: return `embedding_regenerated: false` AND
+  `warning: "Embedding unavailable. Policy saved but will not appear in semantic search results until re-indexed."`
+- Validations: empty title/body/applies_to → rejected
+
+**`catalog_set_order`** (spec lines 963–992):
+- Same embedding_regenerated pattern
+- Validate: content is a dict, serialized size ≤ 50KB
+
+**`catalog_delete_item`** (spec lines 996–1023):
+- Add `deleted_at` timestamp to output
+- If item doesn't exist → "not found" (idempotent return)
+- Output: `{"id": "...", "status": "deleted", "deleted_at": "..."}`
+
+**`catalog_list_all`** (spec lines 1026–1065):
+- **Admin-only** (NOT staff+)
+- Add optional `limit` (default 50, max 200), `offset` (default 0) params
+- Make `entity_type` optional (None/absent returns all types)
+- Add `total` and `returned` to output
+- Not audit logged
+
+### 3.24 Database — ticket_notes Table (spec lines 1717–1734)
+
+**This table does NOT exist.** Must create:
+```sql
+CREATE TABLE IF NOT EXISTS ticket_notes (
+  id SERIAL PRIMARY KEY,
+  ticket_id TEXT NOT NULL REFERENCES tickets(id),
+  author_sub TEXT NOT NULL,
+  author_role TEXT NOT NULL,
+  body TEXT NOT NULL,
+  note_type TEXT NOT NULL,
+  created_at TIMESTAMPTZ DEFAULT now()
+);
+```
+
+### 3.25 Seed Data Files (spec lines 2376–2384)
+
+**`seed/tickets.json`** — 5 sample tickets:
+- 1 with `created_by` set to dev-user-001
+- 1 with `assigned_to` set
+- 1 with `csat_score`
+- 1 with `freshdesk_id`
+- Varied statuses (open, triaged, in_progress, pending, resolved)
+
+**`seed/attachments.json`** — 2 attachment rows linked to seed tickets.
+
+**`seed/notifications.json`** — 1 notification config for dev-user-001.
+
+### 3.26 Deployment Files
+
+**`Dockerfile`:**
+```dockerfile
+FROM python:3.14-slim
+WORKDIR /app
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
+COPY pyproject.toml uv.lock ./
+RUN uv sync --no-dev --frozen
+COPY src/ ./src/
+COPY seed/ ./seed/
+COPY admin/ ./admin/
+EXPOSE 8080
+CMD ["uv", "run", "python", "-m", "connector_app.server"]
+```
+
+**`fly.toml`:** App name "support-desk", region "iad", PORT=8080, health check on /health.
+
+### 3.27 server.py Infrastructure (spec lines 2326–2367)
+
+- **`/health` GET endpoint** — returns `{"status": "ok"}` without auth (for Fly.io health checks)
+- **Admin route path resolution** — use `Path(__file__).resolve().parent.parent.parent / 'admin' / 'index.html'`
+  instead of relative string (which breaks from different CWDs)
+- **`tools/list` filtering** — implement role-based tool filtering (see 3.2)
+
+---
+
+## 4. Implementation Order (12 Phases, 35 Steps)
+
+### Phase 1: Database & Seed Data (3 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 1.1 | Verify all 6 DDL tables exist in Neon. Create `ticket_notes` table. | (Neon SQL) |
+| 1.2 | Seed `config_history` (version_index=0 for rules+persona if missing). Verify config rows current. | (Neon SQL) |
+| 1.3 | Create seed data files: `seed/tickets.json`, `seed/attachments.json`, `seed/notifications.json`. | New files |
+
+### Phase 2: Role Gating Correction (5 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 2.1 | Fix role gates: `report_summary`→admin, `agent_performance`→admin, `catalog_list_all`→admin | tools/domain.py, tools/config.py, server.py |
+| 2.2 | Implement `tools/list` role-based filtering in server.py | server.py, role_gate.py |
+| 2.3 | Fix `get_ticket` identity: staff sees own+assigned, not all | tools/domain.py |
+| 2.4 | Fix `get_attachment` identity: same pattern as get_ticket | tools/domain.py |
+| 2.5 | Fix `attach_file` customer access: customers can attach to own tickets | tools/domain.py, server.py |
+
+### Phase 3: Core v2 Tool Fixes (5 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 3.1 | `get_ticket`: add `attachment_count`, `attachment_ids` | tools/domain.py |
+| 3.2 | `get_customer_profile`: add `csat_trend` | tools/domain.py |
+| 3.3 | `submit_csat`: resolved-only gate, `already_rated` handling | tools/domain.py |
+| 3.4 | `create_ticket`: add `category` param, validation, embedding | tools/domain.py, server.py |
+| 3.5 | `assign_ticket`: rename `agent`, resolved rejection, case-insensitive, FOR UPDATE | tools/domain.py, server.py |
+
+### Phase 4: Attachment System — R2 (3 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 4.1 | Implement R2 S3 client helpers in domain.py (upload, presigned URL) | tools/domain.py |
+| 4.2 | Rewrite `attach_file`: MIME allowlist, 10MB limit, 10-attach limit, base64 validation, R2 upload | tools/domain.py |
+| 4.3 | Rewrite `get_attachment`: presigned URL (15-min expiry), remove inline base64 | tools/domain.py |
+
+### Phase 5: Updates, Drafts & Notifications (4 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 5.1 | Rewrite `draft_reply`: structured context with policy, history, agent | tools/domain.py |
+| 5.2 | `update_ticket`: add `reply_body`, category enum, reopen clears | tools/domain.py, server.py |
+| 5.3 | `reassign_ticket`: add `reason` param, `previous_agent` output | tools/domain.py, server.py |
+| 5.4 | Wire `notifications.dispatch()` into update_ticket (ticket creator only) | tools/domain.py |
+
+### Phase 6: Notification Config Validation (2 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 6.1 | `configure_notifications`: email/HTTPS/event validation, "all" expansion, read-mode | tools/user.py, server.py |
+| 6.2 | Fix `notifications.dispatch`: filter by ticket creator, fix webhook header name | notifications.py |
+
+### Phase 7: Reports & Audit (3 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 7.1 | `report_summary`: new period values, all output fields from spec | tools/domain.py |
+| 7.2 | `agent_performance`: `period` param, csat/SLA/escalation fields | tools/domain.py, server.py |
+| 7.3 | `get_audit_log`: add `total_matching`, `returned`, `id`; limit→500 | tools/domain.py |
+
+### Phase 8: External Integrations (3 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 8.1 | Rewrite `sync_to_freshdesk`: per-ticket, `action` param, real FD API with mappings | tools/domain.py, server.py |
+| 8.2 | Fix `sync.py` background loop: filter open/in_progress, config store creds, ignore FD Status 2 | sync.py |
+| 8.3 | `get_order`: Shopify fallback, `source` field, graceful error | tools/domain.py |
+
+### Phase 9: Admin Config Tools (3 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 9.1 | `set_rules`/`set_persona`: validation, output format | tools/config.py |
+| 9.2 | `restore_version`: version_index=0 rejection, error messages | tools/config.py |
+| 9.3 | `set_freshdesk_creds`/`set_shopify_creds`: actual config store, audit masking | tools/config.py |
+
+### Phase 10: Catalog Fixes (2 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 10.1 | `set_policy`/`set_order`: `embedding_regenerated` field, warning, validation | catalog.py |
+| 10.2 | `list_all`: admin-only, pagination. `delete_item`: deleted_at, not-found | catalog.py, server.py |
+
+### Phase 11: Infrastructure (2 steps)
+
+| Step | What | Files |
+|------|------|-------|
+| 11.1 | Create `Dockerfile`, `fly.toml` | New files |
+| 11.2 | Add `/health` endpoint, fix admin route path resolution | server.py |
+
+### Phase 12: Final Verification (1 step)
+
+| Step | What | Files |
+|------|------|-------|
+| 12.1 | Run tests. Verify tool listing. Clean commit. | tests/ |
+
+---
+
+## 5. Key Design Decisions
+
+### 5.1 Config Versioning (spec contradiction resolved)
+
+The `config_set_rules` section (line 868) says "NOT versioned / destructive" but `config_restore_version` and `config_history` depend on versioning. **Decision: Keep versioning.** The "not versioned" statement is outdated. Every `config_set_rules`/`config_set_persona` saves the previous value to `config_history` before overwriting.
+
+### 5.2 R2 Presigned URL Generation
+
+Use boto3's `generate_presigned_url` with `ClientMethod='get_object'`, `ExpiresIn=900` (15 min).
+Credentials read from env vars: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`, `R2_BUCKET`.
+Endpoint URL format: `https://<accountid>.r2.cloudflarestorage.com`.
+
+### 5.3 FastMCP tools/list Filtering
+
+FastMCP 3.4.4 supports `add_tool_transformation()` which receives a list of `Tool` objects
+before they are returned. Install a transformation that filters based on the session's role.
+The role is read from the request context by inspecting the session token.
+
+Since `tools/list` is an MCP method (not a tool), the transformation approach won't directly work
+for the initial `list` response. Alternative: wrap the MCP app's `list_tools` endpoint to
+inspect the Authorization header, extract the session token, decode it, and filter.
+
+Implementation approach: Monkey-patch or wrap the FastMCP tool listing to check the `role` claim
+from the session token in the request context. Use `get_access_token()` to get the token,
+decode it, and filter tools accordingly.
+
+### 5.4 Freshdesk Status Mapping (spec lines 1331–1347)
+
+```
+Local → Freshdesk (push):
+  open/triaged   → 2 (Open)
+  in_progress    → 3 (Pending)
+  pending        → 3 (Pending)     [collapsed — no local equivalent in FD]
+  resolved       → 4 (Resolved)
+  closed         → 5 (Closed)
+
+Freshdesk → Local (pull):
+  2 (Open)       → IGNORED         [local authoritative]
+  3 (Pending)    → pending
+  4 (Resolved)   → resolved
+  5 (Closed)     → closed
+```
+
+### 5.5 SLA Breach Definition (spec lines 753–758)
+
+SLA breaches = count of tickets STILL OPEN at period end past their SLA target:
+- critical > 1 hour
+- high > 4 hours
+- medium > 24 hours
+- low > 72 hours
+
+This is a **current-backlog metric**: tickets that breached SLA but were resolved before
+period end are NOT counted.
+
+---
+
+## 6. Invariant Preservation
 
 | # | Invariant | How preserved |
 |---|-----------|---------------|
-| 1 | One gateway | All new tools are `@mcp.tool` on the same FastMCP instance. No second server. |
-| 2 | Tools only | No resources, no prompts. Admin dashboard uses tools via fetch(), not a new API. |
-| 3 | Prove, don't trust | All tools use `sub` from session token. No `user_id` parameter. `require_role()` checks the HMAC-signed role claim. |
-| 4 | Fail closed | Every tool still returns `_reminder`. Admin tools return `"not found"` for unauthorized callers (identical to nonexistent). |
+| 1 | One gateway | All tools on same FastMCP instance. No second server. |
+| 2 | Tools only | No resources or prompts. Admin dashboard uses tools via fetch(). |
+| 3 | Prove, don't trust | All tools use `sub` from session token. No `user_id` parameter. `tools/list` filters by role. |
+| 4 | Fail closed | Every tool returns `_reminder`. Admin tools return "not found" for unauthorized callers. |
 
-## 8. Files That Change
+---
+
+## 7. Files That Change (Summary)
 
 | File | Change scope |
 |------|-------------|
-| `session.py` | +15 lines (role claim, `require_role`) |
-| `server.py` | Structural: extract tools to modules; +Admin route, +health route; `begin_session` gains role. **Dockerfile** must add `COPY admin/ ./admin/` to serve the dashboard. |
-| `config_store.py` | +80 lines (set_rules, set_persona, history, restore) |
-| `db.py` | +30 lines (migration helpers) |
-| **New**: `tools/domain.py` | ~1100 lines (existing 7 domain tools + 10 new + state machine helper + notification dispatch calls) |
-| **New**: `tools/user.py` | ~100 lines (existing 2 + configure_notifications) |
-| **New**: `tools/config.py` | ~150 lines (existing 2 + 8 new admin/catalog tools) |
-| **New**: `catalog.py` | ~120 lines (embedding pipeline, upsert/delete) |
-| **New**: `notifications.py` | ~80 lines (SendGrid + webhook) |
-| **New**: `sync.py` | ~60 lines (background Freshdesk polling) |
-| **New**: `role_gate.py` | ~40 lines |
-| **New**: `admin/index.html` | ~500 lines (static dashboard) |
-| `pyproject.toml` | +1 dep: `boto3` |
-| `.env` | +12 optional vars |
+| `server.py` | Role-gating fixes for 3 tools, `tools/list` filtering, `/health` route, admin route path fix, customer attach_file access |
+| `tools/domain.py` | 18 tool implementations — most need fixes per 3.3–3.21 above |
+| `tools/user.py` | `configure_notifications` validation + read-mode |
+| `tools/config.py` | validation, output format, actual credential storage |
+| `catalog.py` | field names, validation, pagination, admin-gate |
+| `notifications.py` | Fix webhook header name, creator-only filtering |
+| `sync.py` | Fix query scope, config store creds, FD status handling |
+| `role_gate.py` | Add `filter_tools_for_role()` function |
+| `admin/index.html` | No changes (already correct) |
+| `seed/tickets.json` | **New** — 5 sample tickets |
+| `seed/attachments.json` | **New** — 2 attachment rows |
+| `seed/notifications.json` | **New** — 1 notification config |
+| `Dockerfile` | **New** |
+| `fly.toml` | **New** |
+| `tests/test_starter.py` | Fix for `require_session` return type (already done) |
+
+---
+
+## 8. Verification
+
+After all phases:
+- `uv run pytest -q` — all 8 tests pass
+- `AUTH_DISABLED=1 uv run python -c "from connector_app.server import mcp..."` — all tools listed
+- Spec acceptance criteria checked via manual curl/calls
+- `git log` shows one commit per step for clean rollback
