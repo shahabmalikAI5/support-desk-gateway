@@ -69,23 +69,44 @@ Spec references are to `v2-v3-spec.md` line numbers.
 | `domain_agent_performance` | staff+ | admin-only | Tighten to admin |
 | `domain_report_summary` | staff+ | admin-only | Tighten to admin |
 | `catalog_list_all` | staff+ | admin-only | Tighten to admin |
-| `domain_get_ticket` | staff sees ALL tickets | staff sees own + assigned | Fix identity check |
-| `domain_get_attachment` | staff sees ALL attachments | staff sees own + assigned | Fix identity check |
+| `domain_get_ticket` | staff sees ALL tickets | staff & admin see own + assigned | Fix identity check |
+| `domain_get_attachment` | staff sees ALL attachments | staff & admin see own + assigned | Fix identity check |
 | `domain_attach_file` | staff+ only | customers can attach to own tickets | Allow customers |
+
+**Note on get_ticket hardening**: Per spec line 1468, staff AND admins both follow the same
+`created_by = sub OR assigned_to = sub` rule. Admins do NOT get unrestricted global visibility
+to all tickets — reporting tools serve aggregate data. This prevents casual admin browsing
+of other users' tickets.
 
 ### 3.2 tools/list Role Filtering (spec lines 1456–1461)
 
 The MCP `tools/list` response must exclude tools based on role:
-- **Customer (no role):** ~12 tools (health, begin_session, create_ticket, get_ticket, search,
-  get_policy, get_order, submit_csat, attach_file, get_attachment, get_customer_profile,
-  save_state, get_profile, configure_notifications)
-- **Staff (role="staff"):** ~18 tools (customer + assign, reassign, update_ticket, draft_reply,
-  get_audit_log, sync_to_freshdesk)
-- **Admin (role="admin"):** all ~28 customer tools + report_summary, agent_performance,
-  config_set_*, config_restore_version, catalog_set_*, catalog_delete_item, catalog_list_all,
-  config_set_freshdesk_creds, config_set_shopify_creds
+- **Customer (no role):** 15 tools (health, begin_session, domain_create_ticket,
+  domain_get_ticket, domain_search, domain_get_policy, domain_get_order, domain_submit_csat,
+  domain_attach_file, domain_get_attachment, domain_get_customer_profile,
+  domain_list_my_tickets, user_save_state, user_get_profile, user_configure_notifications)
+- **Staff (role="staff"):** 21 tools (customer + domain_assign_ticket, domain_reassign_ticket,
+  domain_update_ticket, domain_draft_reply, domain_get_audit_log, domain_sync_to_freshdesk)
+- **Admin (role="admin"):** all ~28 tools (staff + domain_report_summary,
+  domain_agent_performance, config_set_rules, config_set_persona, config_restore_version,
+  catalog_set_policy, catalog_set_order, catalog_delete_item, catalog_list_all,
+  config_set_freshdesk_creds, config_set_shopify_creds)
 
-**Implementation:** Hook into `mcp.list_tools()` via `add_tool_transformation()` to filter.
+**Implementation challenge:** `tools/list` is called BEFORE any session token exists (the
+client needs to discover `begin_session` first). The role cannot come from the session token
+— it must come from the **Descope JWT** in the Authorization header (`get_access_token()` →
+`claims.role`).
+
+The filtering must happen at the Starlette middleware level, not inside FastMCP. Approach:
+1. Mount a custom ASGI or Starlette middleware before the `/mcp` route
+2. Intercept `POST /mcp` with JSON-RPC body `{"method": "tools/list"}`
+3. Read the Descope JWT from the `Authorization` header
+4. Extract the `role` claim from the JWT
+5. After the MCP handler returns the tool list, filter it by role
+6. Return the filtered list
+
+This is the only approach since FastMCP's `add_tool_transformation()` runs at
+registration time, not at request time, and has no access to the request context.
 
 ### 3.3 Multi-Tenant Identity Checks (spec lines 1463–1481)
 
@@ -105,11 +126,16 @@ Add to the SELECT or as a second query.
 
 ### 3.5 `domain_get_customer_profile` — csat_trend (spec lines 1286–1297)
 
-Must return `csat_trend` field. Compute from last 5 rated tickets:
-- `"improving"` — last 5 scores show upward trend
-- `"declining"` — downward
-- `"stable"` — flat or <3 rated tickets
-- `null` — no rated tickets
+Must return `csat_trend` field. Algorithm:
+1. Query last 5 rated tickets for this user, ordered by `csat_submitted_at DESC`,
+   non-null `csat_score` only.
+2. If 0 rated tickets: `null`.
+3. If < 3 rated tickets: `"stable"`.
+4. If ≥ 3: compute the trend as `sign(sum(last_n - second_last_n for each adjacent pair))`.
+   Positive sum → `"improving"`, negative → `"declining"`, zero → `"stable"`.
+   Example: scores [5, 4, 3] → differences [-1, -1] → sum -2 → "declining".
+   Example: scores [3, 4, 5] → differences [+1, +1] → sum +2 → "improving".
+   Example: scores [4, 4, 5] → differences [0, +1] → sum +1 → "improving".
 
 ### 3.6 `domain_create_ticket` — category param (spec line 400)
 
@@ -138,10 +164,16 @@ Changes from current:
 
 ### 3.9 `domain_update_ticket` (spec lines 482–533)
 
+**Parameter clarification:** The existing `body` param replaces the ticket's body text.
+The new `reply_body` param appends an agent reply as a ticket note (INSERT into
+`ticket_notes`). They are independent — providing both updates the body AND appends a note.
+
 Major changes:
 - Add `reply_body: str | None = None` param
-  → When provided, INSERT into `ticket_notes` with `note_type='reply'`
+  → When provided, INSERT into `ticket_notes` with `note_type='reply'`,
+    `author_role='staff'` (or 'admin'), `author_sub=sub`
   → Trigger `notifications.dispatch()` for the ticket creator
+  → Output includes `reply_sent: true`
 - Add category validation: must be one of billing, returns, technical, account, shipping, other
   → Reject with: `"category must be one of: billing, returns, technical, account, shipping, other"`
 - Reopen behavior (status="open" from resolved):
@@ -150,6 +182,8 @@ Major changes:
   → Clear `freshdesk_synced_at = NULL`
 - All params optional — calling with just `ticket_id` returns current state (no-op)
 - Use `SELECT ... FOR UPDATE` for concurrent safety
+- Output when reply_body provided: `{"ticket_id": "...", "status": "...", "reply_sent": true,
+  "updated_at": "..."}`
 
 ### 3.10 `domain_submit_csat` (spec lines 536–569)
 
@@ -159,7 +193,9 @@ Changes from current:
 - **Already-rated handling:** If `csat_score IS NOT NULL`:
   Return `{"csat_score": existing, "already_rated": true, "submitted_at": original_ts}`
   Do NOT overwrite.
-- Use `SELECT ... FOR UPDATE` on the ticket row
+- Use `SELECT ... FOR UPDATE` on the ticket row to prevent race condition: if two
+  concurrent calls both read `csat_score IS NULL` before either commits, only the
+  first write should succeed. The second call sees `csat_score` set and returns `already_rated`.
 
 ### 3.11 `domain_attach_file` (spec lines 571–611)
 
@@ -201,11 +237,14 @@ Rewrite from current:
   `support_embeddings WHERE entity_type='policy'`. Return first match's ID, title, and
   body excerpt (first 300 chars).
 - Fetch customer history: count of previous tickets, avg CSAT
+- **Note:** The codebase stores only `created_by` (an opaque `sub` string), not a display name.
+  There is no Descope profile lookup. Return `created_by` as `customer_name` (it will be the
+  OAuth sub). The AI model may resolve it to a name if it has context from the conversation.
 - Return structured:
   ```json
   {
     "ticket_id": "tkt-004",
-    "customer_name": "Priya",
+    "customer_name": "user-priya-88",
     "ticket_subject": "Damaged item...",
     "ticket_body": "I received...",
     "ticket_status": "in_progress",
@@ -254,8 +293,9 @@ Changes from current:
 ### 3.16 `domain_get_audit_log` (spec lines 811–854)
 
 Changes from current:
-- **Add `total_matching`** — COUNT(*) before LIMIT
-- **Add `returned`** — len(entries) in this response
+- **Add `total_matching`** — run a separate `SELECT COUNT(*)` query with the same WHERE
+  filters but WITHOUT the LIMIT clause
+- **Add `returned`** — len(entries) in this response (same as min(limit, total_matching))
 - **Add `id`** to each entry
 - **Max limit: 500** (currently 200)
 - Entry format:
@@ -286,6 +326,10 @@ Changes from current:
   - FD status 3 → "pending", 4 → "resolved", 5 → "closed"
   - FD priority: 4→critical, 3→high, 2→medium, 1→low
 - **Credentials:** Read from config store first, fall back to env vars
+- **Auth format:** Freshdesk uses HTTP Basic Auth with `api_key` as username and `X` as password
+  (`httpx.BasicAuth(api_key, "X")`)
+- **API endpoints:** `POST /api/v2/tickets` (create), `PUT /api/v2/tickets/{id}` (update),
+  `GET /api/v2/tickets/{id}` (fetch)
 - **Error handling:** FD API unreachable → graceful error, no crash
 
 ### 3.18 `domain_get_order` — Shopify fallback (spec lines 1483–1495)
@@ -295,8 +339,8 @@ Changes from current:
 - **Shopify fallback:** If not found locally, query Shopify API:
   `GET https://{store_domain}/admin/api/2024-07/orders/{order_id}.json`
   with `X-Shopify-Access-Token` header
-- **Shopify down:** Return `{"error": "...", "source": "catalog_only"}` — do not crash
-- **No creds configured:** Skip Shopify lookup, local catalog only, no error
+- **Shopify down:** Return `{"error": "Live order lookup temporarily unavailable. Local catalog returned: not found.", "source": "catalog_only"}` — do not crash
+- **No creds configured:** Skip Shopify lookup, local catalog only, no error (`source: "catalog"`)
 
 ### 3.19 `user_configure_notifications` (spec lines 1373–1413)
 
@@ -388,12 +432,17 @@ CREATE TABLE IF NOT EXISTS ticket_notes (
   id SERIAL PRIMARY KEY,
   ticket_id TEXT NOT NULL REFERENCES tickets(id),
   author_sub TEXT NOT NULL,
-  author_role TEXT NOT NULL,
+  author_role TEXT NOT NULL,   -- 'customer', 'staff', 'admin', or 'system'
   body TEXT NOT NULL,
-  note_type TEXT NOT NULL,
+  note_type TEXT NOT NULL,     -- 'reply', 'internal_note', or 'system_event'
   created_at TIMESTAMPTZ DEFAULT now()
 );
 ```
+
+**note_type values** (spec line 1728):
+- `'reply'` — agent/customer reply (used by `domain_update_ticket` with `reply_body`)
+- `'internal_note'` — internal agent note (not exposed to the ticket creator)
+- `'system_event'` — auto-generated audit note (assignment, reassignment, status change)
 
 ### 3.25 Seed Data Files (spec lines 2376–2384)
 
@@ -435,7 +484,7 @@ CMD ["uv", "run", "python", "-m", "connector_app.server"]
 
 ---
 
-## 4. Implementation Order (12 Phases, 35 Steps)
+## 4. Implementation Order (12 Phases, 36 Steps)
 
 ### Phase 1: Database & Seed Data (3 steps)
 
@@ -473,21 +522,21 @@ CMD ["uv", "run", "python", "-m", "connector_app.server"]
 | 4.2 | Rewrite `attach_file`: MIME allowlist, 10MB limit, 10-attach limit, base64 validation, R2 upload | tools/domain.py |
 | 4.3 | Rewrite `get_attachment`: presigned URL (15-min expiry), remove inline base64 | tools/domain.py |
 
-### Phase 5: Updates, Drafts & Notifications (4 steps)
+### Phase 5: Notification Config & Dispatch (2 steps)
 
 | Step | What | Files |
 |------|------|-------|
-| 5.1 | Rewrite `draft_reply`: structured context with policy, history, agent | tools/domain.py |
-| 5.2 | `update_ticket`: add `reply_body`, category enum, reopen clears | tools/domain.py, server.py |
-| 5.3 | `reassign_ticket`: add `reason` param, `previous_agent` output | tools/domain.py, server.py |
-| 5.4 | Wire `notifications.dispatch()` into update_ticket (ticket creator only) | tools/domain.py |
+| 5.1 | `configure_notifications`: email/HTTPS/event validation, "all" expansion, read-mode | tools/user.py, server.py |
+| 5.2 | Fix `notifications.dispatch`: filter by ticket creator (not any user with matching config), fix webhook header name to `X-Webhook-Signature` | notifications.py |
 
-### Phase 6: Notification Config Validation (2 steps)
+### Phase 6: Drafts, Updates & Notification Wiring (4 steps)
 
 | Step | What | Files |
 |------|------|-------|
-| 6.1 | `configure_notifications`: email/HTTPS/event validation, "all" expansion, read-mode | tools/user.py, server.py |
-| 6.2 | Fix `notifications.dispatch`: filter by ticket creator, fix webhook header name | notifications.py |
+| 6.1 | Rewrite `draft_reply`: structured context with policy, history, agent | tools/domain.py |
+| 6.2 | `update_ticket`: add `reply_body`, category enum, reopen clears | tools/domain.py, server.py |
+| 6.3 | `reassign_ticket`: add `reason` param, `previous_agent` output | tools/domain.py, server.py |
+| 6.4 | Wire `notifications.dispatch()` into update_ticket (fires only for ticket's `created_by` user) | tools/domain.py |
 
 ### Phase 7: Reports & Audit (3 steps)
 
@@ -547,19 +596,25 @@ Use boto3's `generate_presigned_url` with `ClientMethod='get_object'`, `ExpiresI
 Credentials read from env vars: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`, `R2_BUCKET`.
 Endpoint URL format: `https://<accountid>.r2.cloudflarestorage.com`.
 
-### 5.3 FastMCP tools/list Filtering
+### 5.3 FastMCP tools/list Role Filtering
 
-FastMCP 3.4.4 supports `add_tool_transformation()` which receives a list of `Tool` objects
-before they are returned. Install a transformation that filters based on the session's role.
-The role is read from the request context by inspecting the session token.
+`tools/list` is an MCP protocol method, not a registered tool. FastMCP's
+`add_tool_transformation()` runs at registration time — it cannot filter per-request.
+Additionally, `tools/list` is called BEFORE `begin_session`, so there is no session token.
 
-Since `tools/list` is an MCP method (not a tool), the transformation approach won't directly work
-for the initial `list` response. Alternative: wrap the MCP app's `list_tools` endpoint to
-inspect the Authorization header, extract the session token, decode it, and filter.
+**Approach — Starlette middleware on `/mcp`:**
 
-Implementation approach: Monkey-patch or wrap the FastMCP tool listing to check the `role` claim
-from the session token in the request context. Use `get_access_token()` to get the token,
-decode it, and filter tools accordingly.
+1. Mount a Starlette middleware or custom route handler wrapping the MCP app's mount
+2. For `POST /mcp` with JSON-RPC body `{"method": "tools/list"}`:
+   a. Extract the Descope JWT from the `Authorization` header (always sent by the client)
+   b. Decode it to get the `role` claim (uses `get_access_token()` → `claims.role`)
+   c. Call the original MCP handler to get the full tool list
+   d. Filter: `role="admin"` → all tools; `role="staff"` → customer+agent; `role=null` → customer only
+   e. Return the filtered list
+
+**Fallback:** If middleware is too fragile, rely on backend role gating alone — every tool
+already checks role on invocation and returns `"not found"` for unauthorized callers.
+The tools/list filtering is defense-in-depth, not the sole access control mechanism.
 
 ### 5.4 Freshdesk Status Mapping (spec lines 1331–1347)
 
