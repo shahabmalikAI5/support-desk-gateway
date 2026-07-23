@@ -472,13 +472,13 @@ async def catalog_delete_item(item_id: str, entity_type: str, session_token: str
 
 
 @mcp.tool
-async def catalog_list_all(entity_type: str, session_token: str) -> dict:
-    """List all catalog items of a given type (policy or order)."""
+async def catalog_list_all(session_token: str, entity_type: str | None = None, limit: int = 50, offset: int = 0) -> dict:
+    """List catalog items. entity_type: policy, order, or omit for all. Paginate with limit/offset."""
     sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
     pool = await get_pool()
-    return await catalog_tools.list_all(pool, sub, role, entity_type, _REMINDER)
+    return await catalog_tools.list_all(pool, sub, role, entity_type, _REMINDER, limit=limit, offset=offset)
 
 
 # ── Admin dashboard route ─────────────────────────────────────────────────────
