@@ -275,13 +275,13 @@ async def domain_report_summary(period: str, session_token: str) -> dict:
 
 
 @mcp.tool
-async def domain_agent_performance(agent: str, session_token: str) -> dict:
-    """Performance metrics for a support agent: assigned, resolved, avg time."""
+async def domain_agent_performance(agent: str, session_token: str, period: str | None = None) -> dict:
+    """Performance metrics for a support agent. Period: today, yesterday, week, month, quarter, or omit for all time."""
     sub, role, err = _validate_session(session_token)
     if err is not None:
         return err
     pool = await get_pool()
-    return await domain_tools.agent_performance(pool, sub, role, agent, _REMINDER)
+    return await domain_tools.agent_performance(pool, sub, role, agent, _REMINDER, period=period)
 
 
 @mcp.tool

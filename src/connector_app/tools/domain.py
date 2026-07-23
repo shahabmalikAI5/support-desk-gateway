@@ -646,102 +646,192 @@ async def draft_reply(pool, sub: str, role: str, ticket_id: str, reminder: str) 
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
 
+def _period_bounds(period: str) -> tuple[str, str, str]:
+    """Return (from_ts, to_ts, interval_label) for a given period."""
+    from datetime import datetime, timezone, timedelta
+    now = datetime.now(timezone.utc)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    if period == "today":
+        return midnight.isoformat(), now.isoformat(), "today"
+    elif period == "yesterday":
+        start = midnight - timedelta(days=1)
+        return start.isoformat(), midnight.isoformat(), "yesterday"
+    elif period == "week":
+        start = midnight - timedelta(days=7)
+        return start.isoformat(), midnight.isoformat(), "week"
+    elif period == "month":
+        start = midnight - timedelta(days=30)
+        return start.isoformat(), midnight.isoformat(), "month"
+    elif period == "quarter":
+        start = midnight - timedelta(days=90)
+        return start.isoformat(), midnight.isoformat(), "quarter"
+    raise ValueError("invalid period")
+
+
 async def report_summary(pool, sub: str, role: str, period: str, reminder: str) -> dict:
     allowed_roles = ["admin"]
     if role is None or role not in allowed_roles:
         return {"message": "not found", "_reminder": reminder}
-    if period not in ("daily", "weekly", "monthly"):
-        return {"error": "period must be daily, weekly, or monthly", "_reminder": reminder}
+    if period not in ("today", "yesterday", "week", "month", "quarter"):
+        return {"error": "period must be one of: today, yesterday, week, month, quarter", "_reminder": reminder}
 
-    interval_map = {"daily": "1 day", "weekly": "7 days", "monthly": "30 days"}
-    interval = interval_map[period]
     try:
+        from_ts, to_ts, _ = _period_bounds(period)
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    "SELECT COUNT(*) FROM tickets WHERE created_at >= now() - %s::interval",
-                    (interval,),
+                    "SELECT COUNT(*) FROM tickets WHERE created_at >= %s::timestamptz AND created_at < %s::timestamptz",
+                    (from_ts, to_ts),
                 )
-                new_tickets = (await cur.fetchone())[0]
+                tickets_created = (await cur.fetchone())[0]
 
                 await cur.execute(
-                    "SELECT COUNT(*) FROM tickets WHERE resolved_at >= now() - %s::interval OR (status = 'resolved' AND updated_at >= now() - %s::interval)",
-                    (interval, interval),
+                    "SELECT COUNT(*) FROM tickets WHERE resolved_at >= %s::timestamptz AND resolved_at < %s::timestamptz",
+                    (from_ts, to_ts),
                 )
-                resolved = (await cur.fetchone())[0]
+                tickets_resolved = (await cur.fetchone())[0]
 
                 await cur.execute(
-                    "SELECT COUNT(*) FROM tickets WHERE status = 'open' AND created_at < now() - %s::interval",
-                    (interval,),
-                )
-                still_open = (await cur.fetchone())[0]
-
-                await cur.execute(
-                    "SELECT AVG(EXTRACT(EPOCH FROM (COALESCE(resolved_at, updated_at) - created_at)) / 3600.0) "
-                    "FROM tickets WHERE (resolved_at IS NOT NULL OR (status = 'resolved' AND updated_at IS NOT NULL)) "
-                    "AND created_at >= now() - %s::interval",
-                    (interval,),
+                    "SELECT AVG(EXTRACT(EPOCH FROM (resolved_at - created_at)) / 3600.0) "
+                    "FROM tickets WHERE resolved_at >= %s::timestamptz AND resolved_at < %s::timestamptz",
+                    (from_ts, to_ts),
                 )
                 avg_row = await cur.fetchone()
                 avg_resolution = round(float(avg_row[0]), 1) if avg_row and avg_row[0] is not None else None
 
                 await cur.execute(
-                    "SELECT status, COUNT(*) as cnt FROM tickets WHERE created_at >= now() - %s::interval "
-                    "GROUP BY status ORDER BY cnt DESC",
-                    (interval,),
+                    "SELECT AVG(csat_score) FROM tickets WHERE csat_score IS NOT NULL "
+                    "AND resolved_at >= %s::timestamptz AND resolved_at < %s::timestamptz",
+                    (from_ts, to_ts),
                 )
-                by_status = {r[0]: r[1] for r in await cur.fetchall()}
+                csat_row = await cur.fetchone()
+                avg_csat = round(float(csat_row[0]), 1) if csat_row and csat_row[0] is not None else None
 
-        await log_audit(pool, sub, "domain_report_summary", f"period={period}", f"new={new_tickets}")
+                await cur.execute(
+                    "SELECT COUNT(*) FROM tickets WHERE status NOT IN ('resolved', 'closed') "
+                    "AND ((priority = 'critical' AND created_at < %s::timestamptz - INTERVAL '1 hour') "
+                    "OR (priority = 'high' AND created_at < %s::timestamptz - INTERVAL '4 hours') "
+                    "OR (priority = 'medium' AND created_at < %s::timestamptz - INTERVAL '24 hours') "
+                    "OR (priority = 'low' AND created_at < %s::timestamptz - INTERVAL '72 hours'))",
+                    (to_ts, to_ts, to_ts, to_ts),
+                )
+                sla_breaches = (await cur.fetchone())[0]
+
+                await cur.execute(
+                    "SELECT category, COUNT(*) as cnt FROM tickets "
+                    "WHERE category IS NOT NULL AND created_at >= %s::timestamptz AND created_at < %s::timestamptz "
+                    "GROUP BY category ORDER BY cnt DESC LIMIT 5",
+                    (from_ts, to_ts),
+                )
+                top_categories = [{"category": r[0], "count": r[1]} for r in await cur.fetchall()]
+
+                await cur.execute(
+                    "SELECT priority, COUNT(*) FROM tickets "
+                    "WHERE created_at >= %s::timestamptz AND created_at < %s::timestamptz "
+                    "GROUP BY priority ORDER BY priority",
+                    (from_ts, to_ts),
+                )
+                by_priority = {r[0]: r[1] for r in await cur.fetchall()}
+
+        await log_audit(pool, sub, "domain_report_summary", f"period={period}", f"created={tickets_created}")
         return {
-            "period": period, "new_tickets": new_tickets, "resolved": resolved,
-            "still_open": still_open, "avg_resolution_time_hours": avg_resolution,
-            "by_status": by_status, "_reminder": reminder,
+            "period": period, "from": from_ts, "to": to_ts,
+            "tickets_created": tickets_created, "tickets_resolved": tickets_resolved,
+            "avg_resolution_time_hours": avg_resolution,
+            "avg_csat_score": avg_csat,
+            "sla_breaches": sla_breaches,
+            "top_categories": top_categories,
+            "by_priority": by_priority,
+            "_reminder": reminder,
         }
     except Exception:
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
 
-async def agent_performance(pool, sub: str, role: str, agent: str, reminder: str) -> dict:
+async def agent_performance(pool, sub: str, role: str, agent: str, reminder: str, *,
+                             period: str | None = None) -> dict:
     allowed_roles = ["admin"]
     if role is None or role not in allowed_roles:
         return {"message": "not found", "_reminder": reminder}
+    if period is not None and period not in ("today", "yesterday", "week", "month", "quarter"):
+        return {"error": "period must be one of: today, yesterday, week, month, quarter, or omitted", "_reminder": reminder}
+    agent_norm = agent.strip().lower()
+
     try:
+        from_ts = None
+        if period:
+            from_ts, to_ts, _ = _period_bounds(period)
+            time_filter = "AND created_at >= %s::timestamptz AND created_at < %s::timestamptz"
+            time_params = [from_ts, to_ts]
+        else:
+            time_filter = ""
+            time_params = []
+
+        base = "SELECT COUNT(*) FROM tickets WHERE LOWER(assigned_to) = %s"
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute(
-                    "SELECT COUNT(*) FROM tickets WHERE assigned_to = %s",
-                    (agent,),
-                )
-                total_assigned = (await cur.fetchone())[0]
+                await cur.execute(base + time_filter, [agent_norm] + time_params)
+                tickets_assigned = (await cur.fetchone())[0]
 
                 await cur.execute(
-                    "SELECT COUNT(*) FROM tickets WHERE assigned_to = %s AND status IN ('resolved', 'closed')",
-                    (agent,),
+                    base + " AND status IN ('resolved', 'closed')" + time_filter,
+                    [agent_norm] + time_params,
                 )
-                resolved = (await cur.fetchone())[0]
+                tickets_resolved = (await cur.fetchone())[0]
 
                 await cur.execute(
-                    "SELECT AVG(EXTRACT(EPOCH FROM (COALESCE(resolved_at, updated_at) - assigned_at)) / 3600.0) "
-                    "FROM tickets WHERE assigned_to = %s AND assigned_at IS NOT NULL "
-                    "AND (resolved_at IS NOT NULL OR status IN ('resolved', 'closed'))",
-                    (agent,),
+                    "SELECT AVG(EXTRACT(EPOCH FROM (COALESCE(resolved_at, updated_at) - created_at)) / 3600.0) "
+                    "FROM tickets WHERE LOWER(assigned_to) = %s AND status IN ('resolved', 'closed')"
+                    + time_filter,
+                    [agent_norm] + time_params,
                 )
                 avg_row = await cur.fetchone()
                 avg_resolution = round(float(avg_row[0]), 1) if avg_row and avg_row[0] is not None else None
 
                 await cur.execute(
-                    "SELECT status, COUNT(*) FROM tickets WHERE assigned_to = %s GROUP BY status",
-                    (agent,),
+                    "SELECT AVG(csat_score) FROM tickets WHERE LOWER(assigned_to) = %s AND csat_score IS NOT NULL"
+                    + time_filter,
+                    [agent_norm] + time_params,
                 )
-                by_status = {r[0]: r[1] for r in await cur.fetchall()}
+                csat_row = await cur.fetchone()
+                avg_csat = round(float(csat_row[0]), 1) if csat_row and csat_row[0] is not None else None
 
-        await log_audit(pool, sub, "domain_agent_performance", f"agent={agent}",
-                        f"total={total_assigned},resolved={resolved}")
+                await cur.execute(
+                    "SELECT COUNT(*) FROM tickets WHERE LOWER(assigned_to) = %s "
+                    "AND status NOT IN ('resolved', 'closed')" + time_filter,
+                    [agent_norm] + time_params,
+                )
+                current_open = (await cur.fetchone())[0]
+
+                await cur.execute(
+                    "SELECT COUNT(*) FROM tickets WHERE LOWER(assigned_to) = %s "
+                    "AND status NOT IN ('resolved', 'closed') "
+                    "AND ((priority = 'critical' AND created_at < now() - INTERVAL '1 hour') "
+                    "OR (priority = 'high' AND created_at < now() - INTERVAL '4 hours') "
+                    "OR (priority = 'medium' AND created_at < now() - INTERVAL '24 hours') "
+                    "OR (priority = 'low' AND created_at < now() - INTERVAL '72 hours'))" + time_filter,
+                    [agent_norm] + time_params,
+                )
+                sla_breaches = (await cur.fetchone())[0]
+
+                await cur.execute(
+                    "SELECT COUNT(*) FROM tickets WHERE LOWER(assigned_to) = %s "
+                    "AND id IN (SELECT DISTINCT ticket_id FROM ticket_notes WHERE note_type = 'system_event' "
+                    "AND body ILIKE '%escalation%')" + time_filter,
+                    [agent_norm] + time_params,
+                )
+                escalations = (await cur.fetchone())[0]
+
+        await log_audit(pool, sub, "domain_agent_performance", f"agent={agent}", f"assigned={tickets_assigned}")
         return {
-            "agent": agent, "total_assigned": total_assigned, "resolved": resolved,
-            "avg_resolution_time_hours": avg_resolution, "by_status": by_status,
-            "resolution_rate": round(resolved / total_assigned, 2) if total_assigned > 0 else 0,
+            "agent": agent, "period": period or "all_time",
+            "tickets_assigned": tickets_assigned, "tickets_resolved": tickets_resolved,
+            "avg_resolution_time_hours": avg_resolution,
+            "avg_csat_score": avg_csat,
+            "sla_breaches": sla_breaches,
+            "current_open_tickets": current_open,
+            "escalations_handled": escalations,
+            "resolution_rate": round(tickets_resolved / tickets_assigned, 2) if tickets_assigned > 0 else 0,
             "_reminder": reminder,
         }
     except Exception:
@@ -754,6 +844,7 @@ async def get_audit_log(pool, sub: str, role: str, reminder: str, *,
     allowed_roles = ["admin", "staff"]
     if role is None or role not in allowed_roles:
         return {"message": "not found", "_reminder": reminder}
+    actual_limit = min(limit, 500)
     try:
         conditions: list[str] = []
         params: list = []
@@ -771,19 +862,26 @@ async def get_audit_log(pool, sub: str, role: str, reminder: str, *,
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
-                    f"SELECT user_id, tool_name, input_summary, output_summary, created_at "
+                    f"SELECT COUNT(*) FROM audit_log{where}",
+                    params,
+                )
+                total = (await cur.fetchone())[0]
+
+                await cur.execute(
+                    f"SELECT id, user_id, tool_name, input_summary, output_summary, created_at "
                     f"FROM audit_log{where} ORDER BY created_at DESC LIMIT %s",
-                    params + [limit],
+                    params + [actual_limit],
                 )
                 rows = await cur.fetchall()
 
         entries = [
-            {"user_id": r[0], "tool_name": r[1], "input_summary": r[2],
-             "output_summary": r[3], "created_at": r[4].isoformat() if r[4] else None}
+            {"id": r[0], "user_id": r[1], "tool_name": r[2],
+             "input_summary": r[3], "output_summary": r[4],
+             "created_at": r[5].isoformat() if r[5] else None}
             for r in rows
         ]
-        await log_audit(pool, sub, "domain_get_audit_log", f"limit={limit}", f"{len(entries)} entries")
-        return {"entries": entries, "_reminder": reminder}
+        await log_audit(pool, sub, "domain_get_audit_log", f"limit={actual_limit}", f"{len(entries)} entries")
+        return {"entries": entries, "total_matching": total, "returned": len(entries), "_reminder": reminder}
     except Exception:
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
