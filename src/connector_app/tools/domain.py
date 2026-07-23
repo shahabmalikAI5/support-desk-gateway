@@ -467,7 +467,7 @@ async def draft_reply(pool, sub: str, role: str, ticket_id: str, reminder: str) 
 
 
 async def report_summary(pool, sub: str, role: str, period: str, reminder: str) -> dict:
-    allowed_roles = ["admin", "staff"]
+    allowed_roles = ["admin"]
     if role is None or role not in allowed_roles:
         return {"message": "not found", "_reminder": reminder}
     if period not in ("daily", "weekly", "monthly"):
@@ -523,7 +523,7 @@ async def report_summary(pool, sub: str, role: str, period: str, reminder: str) 
 
 
 async def agent_performance(pool, sub: str, role: str, agent: str, reminder: str) -> dict:
-    allowed_roles = ["admin", "staff"]
+    allowed_roles = ["admin"]
     if role is None or role not in allowed_roles:
         return {"message": "not found", "_reminder": reminder}
     try:

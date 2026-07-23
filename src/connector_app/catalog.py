@@ -125,7 +125,7 @@ async def delete_item(pool, sub: str, role: str, item_id: str, entity_type: str,
 
 
 async def list_all(pool, sub: str, role: str, entity_type: str, reminder: str) -> dict:
-    allowed_roles = ["admin", "staff"]
+    allowed_roles = ["admin"]
     if role is None or role not in allowed_roles:
         return {"message": "not found", "_reminder": reminder}
     if entity_type not in ("policy", "order"):
