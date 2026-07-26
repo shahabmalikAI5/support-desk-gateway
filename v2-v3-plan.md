@@ -2,11 +2,29 @@
 
 ## Status
 
-v1 is complete. v2/v3 code was partially implemented from an earlier draft of this plan.
-This document supersedes that work and defines the **full v2-v3-spec.md compliance build**.
-Every gap identified by the gap analysis is addressed below.
+v1 is complete. **All v2 and v3 features are now implemented** (39 tools, 11 DB tables, full admin dashboard) except:
+- Zendesk integration (v3 — out of scope)
+- v4 autonomous agent loop (out of scope)
+- Mobile-responsive admin dashboard (v2 — Phase 14, **DONE**)
+- Production hardening (v2/v3 — Phase 15, **DONE**)
+- Production deployment + seed + verify (v2/v3 — Phase 16, **in progress**)
 
-**56 gaps identified (28 HIGH, 19 MEDIUM, 9 LOW).** All are covered in the phases below.
+Key architectural changes made during implementation:
+- **Role source**: moved from Descope JWT claims to `users.role` DB column (Descope JWT role claims
+  proved unreliable). `begin_session` does `SELECT role FROM users WHERE id = $sub`.
+- **tools/list filtering**: removed the ASGI-level wrapper. All 39 tools visible in `tools/list`.
+  Role enforcement at tool level via `role_gate.py` (returns `"not found"` for unauthorized callers).
+  DescopeProvider's `scopes_supported=["mcp:read","mcp:write","admin","staff"]` helps claude.ai
+  expose all tools.
+- **Dashboard auth**: shared passphrase (`ADMIN_DASHBOARD_SECRET` from `.env`) instead of Descope
+  OAuth in browser. Dashboard calls tools via `POST /mcp/admin` proxy (validates HS256 session
+  token, bypasses DescopeProvider). Token auto-refreshes every 25 min via `/admin/refresh`.
+  Login via `/admin/exchange` (passphrase → token). One-time dashboard code system via
+  `admin_get_dashboard_token` → `admin_codes` table as alternate path.
+- **Admin tools**: `admin_list_users`, `admin_set_user_role`, `admin_get_dashboard_token`,
+  `admin_list_all_tickets`, `config_list_history` — user/role/ticket management from chat or dashboard.
+- **Seed data**: 6 tickets for admin user, 4 orders, 3 policies, 6 registered users, 2 ticket notes.
+- **Tests**: 8/8 offline tests pass. 11 live smoke tests exist.
 
 ---
 
@@ -41,19 +59,21 @@ src/connector_app/
 ├── catalog.py           # Embedding pipeline for policies/orders
 ├── notifications.py     # SendGrid + webhook dispatch (needs wiring)
 ├── sync.py              # Background Freshdesk polling (needs fixes)
-├── tools/
+  ├── tools/
 │   ├── __init__.py
 │   ├── domain.py        # 18 domain_* implementations
 │   ├── user.py          # 3 user_* implementations
-│   └── config.py        # 7 config_* implementations
+│   ├── config.py        # 9 config_* implementations (incl. config_list_history)
+│   └── admin.py         # 4 admin_* implementations (list_users, set_user_role, list_all_tickets, get_dashboard_token)
 admin/
-└── index.html           # Static admin dashboard
+└── index.html           # Full SPA admin dashboard (6 sections)
 seed/
-├── tickets.json         # MISSING — 5 sample tickets
-├── attachments.json     # MISSING — 2 sample attachment rows
-└── notifications.json   # MISSING — 1 notification config row
-Dockerfile               # MISSING
-fly.toml                 # MISSING
+├── tickets.json         # 5 sample tickets (tkt-010 through tkt-014)
+├── attachments.json     # 2 sample attachment rows
+├── notifications.json   # 1 notification config row
+└── articles.json        # 3 concept articles (superseded)
+Dockerfile               # Deploy container (python:3.14-slim)
+fly.toml                 # Fly.io config (support-desk app)
 ```
 
 ---
@@ -78,35 +98,20 @@ Spec references are to `v2-v3-spec.md` line numbers.
 to all tickets — reporting tools serve aggregate data. This prevents casual admin browsing
 of other users' tickets.
 
-### 3.2 tools/list Role Filtering (spec lines 1456–1461)
+### 3.2 tools/list Role Filtering (removed)
 
-The MCP `tools/list` response must exclude tools based on role:
-- **Customer (no role):** 15 tools (health, begin_session, domain_create_ticket,
-  domain_get_ticket, domain_search, domain_get_policy, domain_get_order, domain_submit_csat,
-  domain_attach_file, domain_get_attachment, domain_get_customer_profile,
-  domain_list_my_tickets, user_save_state, user_get_profile, user_configure_notifications)
-- **Staff (role="staff"):** 21 tools (customer + domain_assign_ticket, domain_reassign_ticket,
-  domain_update_ticket, domain_draft_reply, domain_get_audit_log, domain_sync_to_freshdesk)
-- **Admin (role="admin"):** all ~28 tools (staff + domain_report_summary,
-  domain_agent_performance, config_set_rules, config_set_persona, config_restore_version,
-  catalog_set_policy, catalog_set_order, catalog_delete_item, catalog_list_all,
-  config_set_freshdesk_creds, config_set_shopify_creds)
+**Decision:** Role-based `tools/list` filtering was removed. All 39 tools are returned by `tools/list`
+regardless of caller role. Role enforcement happens exclusively at the tool level via `role_gate.py`
+— unauthorized callers receive `"not found"`.
 
-**Implementation challenge:** `tools/list` is called BEFORE any session token exists (the
-client needs to discover `begin_session` first). The role cannot come from the session token
-— it must come from the **Descope JWT** in the Authorization header (`get_access_token()` →
-`claims.role`).
+The original ASGI wrapper approach (intercepting JSON-RPC responses and filtering by role) was never
+wired to the Starlette app after DescopeProvider migration. The wrapper function `_wrap_tools_list`
+remains in `server.py` as dead code but is not applied to any route.
 
-The filtering must happen at the Starlette middleware level, not inside FastMCP. Approach:
-1. Mount a custom ASGI or Starlette middleware before the `/mcp` route
-2. Intercept `POST /mcp` with JSON-RPC body `{"method": "tools/list"}`
-3. Read the Descope JWT from the `Authorization` header
-4. Extract the `role` claim from the JWT
-5. After the MCP handler returns the tool list, filter it by role
-6. Return the filtered list
-
-This is the only approach since FastMCP's `add_tool_transformation()` runs at
-registration time, not at request time, and has no access to the request context.
+**Current behavior:**
+- `tools/list` returns all 39 tools to all authenticated users
+- `role_gate.py` blocks unauthorized tool invocations at the implementation level
+- Dashboard uses separate `/mcp/admin` proxy endpoint (session token auth, not OAuth)
 
 ### 3.3 Multi-Tenant Identity Checks (spec lines 1463–1481)
 
@@ -480,7 +485,21 @@ CMD ["uv", "run", "python", "-m", "connector_app.server"]
 - **`/health` GET endpoint** — returns `{"status": "ok"}` without auth (for Fly.io health checks)
 - **Admin route path resolution** — use `Path(__file__).resolve().parent.parent.parent / 'admin' / 'index.html'`
   instead of relative string (which breaks from different CWDs)
-- **`tools/list` filtering** — implement role-based tool filtering (see 3.2)
+- **`tools/list` filtering** — no longer filtered at ASGI level. All tools visible. Role enforcement at tool level.
+
+### 3.28 Admin User Role Management (new — post-spec)
+
+| Tool | What | Role |
+|------|------|------|
+| `admin_list_users` | List all users with roles, emails, timestamps | admin-only |
+| `admin_set_user_role` | Set/change user role (admin/staff/customer) | admin-only |
+
+**Dashboard update**: User Management card in `admin/index.html` with role dropdown + "Set" button,
+showing admin's own sub for identity reference.
+
+**Rationale**: Descope JWT role claims proved unreliable for role extraction. Role is now stored
+in `users.role` column (DB). Admin manages roles via these tools in chat or dashboard — no SQL,
+no Descope console config needed.
 
 ---
 
@@ -582,6 +601,72 @@ CMD ["uv", "run", "python", "-m", "connector_app.server"]
 |------|------|-------|
 | 12.1 | Run tests. Verify tool listing. Clean commit. | tests/ |
 
+**Phases 1–12 complete.** All 56 originally identified gaps have been resolved during implementation.
+
+### Phase 13: Admin User Role Management + Dashboard (3 steps) — DONE
+
+| Step | What | Files |
+|------|------|-------|
+| 13.1 | Create `admin_list_users`, `admin_set_user_role`, `admin_list_all_tickets`, `admin_get_dashboard_token`, `config_list_history` tools | tools/admin.py, tools/config.py, server.py |
+| 13.2 | Build full SPA admin dashboard: passphrase login, sidebar nav, 6 sections (Dashboard, Tickets, Rules, Users, Policies, Orders), localStorage + auto-refresh, `/mcp/admin` proxy | admin/index.html, server.py |
+| 13.3 | Add `/admin/exchange`, `/admin/refresh` endpoints. Remove dead `_wrap_tools_list` wrapper. | server.py |
+
+### Phase 14: Mobile-Responsive Admin Dashboard (4 steps) — DONE
+
+| Step | What | Files |
+|------|------|-------|
+| 14.1 | Add hamburger sidebar: CSS-only sidebar collapse at ≤768px, hamburger icon (44x44px, ☰), JS toggle for overlay with backdrop. Sidebar links close overlay on tap. | admin/index.html |
+| 14.2 | Responsive tables: at ≤480px, each `<tr>` becomes a stacked card with label/value pairs. Tickets table shows Subject, Status badge, Priority badge. Users table shows user ID, role badge, Set button inline. Policies/Orders tables show essential fields only. | admin/index.html |
+| 14.3 | Mobile layout fixes: metrics grid → 2-col at 768px → 1-col at 480px (horizontal row layout per card). Overview panels stacked. Full-width buttons (48px height) and inputs. Form rows wrap vertically. Toast at top-center on mobile. Content padding reduced. | admin/index.html |
+| 14.4 | Touch-friendly refinements: all interactive elements ≥44x44px. No `:hover`-only interactions (use `:active` or JS toggle). Hamburger backdrop `position:fixed` with `z-index` layering. Verify 375px iPhone SE viewport — no horizontal overflow on any section. | admin/index.html |
+
+**Implementation approach:** Pure CSS media queries in the existing `<style>` block. No separate mobile file, no CSS framework, no build step, no PWA manifest. Desktop layout (768px+) unchanged. The only JS addition is the hamburger toggle handler — ~10 lines. All other mobile behavior is CSS-driven.
+
+**Key CSS patterns:**
+```
+@media (max-width: 768px) { ... }   /* tablet + phone: sidebar→hamburger, compact metrics */
+@media (max-width: 480px) { ... }   /* phone: card-layout tables, stacked everything */
+```
+
+**Verification:** Chrome DevTools device toolbar → set to iPhone SE (375x667) → verify all 6 sections render without horizontal scroll, all interactions work with touch simulation.
+
+**Zero backend changes.** The `/mcp/admin` proxy, `/admin/exchange`, `/admin/refresh`, and all tool implementations need no modification.
+
+### Phase 15: Production Hardening — Integration Readiness (9 steps) — DONE
+
+| Step | What | Files |
+|------|------|-------|
+| 15.1 | **Shopify credential path:** `get_order` reads `shopify_access_token`/`shopify_store_domain` from config table first, env vars as fallback. Match Freshdesk's `_fd_creds` pattern. Without any creds → `"Shopify not configured"`. | tools/domain.py |
+| 15.2 | **Shopify API version:** `2024-07` → `2025-04`. Add `SHOPIFY_API_VERSION` env var (default `"2025-04"`). | tools/domain.py |
+| 15.3 | **Freshdesk resilience:** Wrap `_fd_request()` with 3x retry + exponential backoff (1s, 2s, 4s). Log all failures to stdout with ticket ID and HTTP status. Add `asyncio.sleep(1)` between sync loop iterations. | tools/domain.py, sync.py |
+| 15.4 | **SendGrid sender:** Remove hardcoded `"shahabmalikAI5@gmail.com"`. Require `SENDGRID_SENDER_EMAIL` env var. Log warning + skip email if unset. Default sender name `"Support Desk"` remains. | notifications.py |
+| 15.5 | **SendGrid dispatch wiring:** Add `dispatch()` calls to `reassign_ticket` (event: `agent_assigned`) and `submit_csat` (event: `resolution`). Fire-and-forget — failure logged, operation proceeds. | tools/domain.py |
+| 15.6 | **R2 fallback removal:** Delete `_ATTACHMENT_STORE` dict and in-memory code paths. When R2 creds missing → `"Attachment storage not configured"` error. | tools/domain.py |
+| 15.7 | **DB pool tuning:** `max_size` 4→10, add `max_lifetime=3600`, `reconnect_timeout=10`, remove redundant `open=True`. | db.py |
+| 15.8 | **Deduplicate `_fd_creds`:** Make public in `sync.py`, import in `tools/domain.py`, delete duplicate. | sync.py, tools/domain.py |
+| 15.9 | **Deduplicate `_get_embedding`:** Make public in `catalog.py`, import in `tools/domain.py`, delete duplicate. | catalog.py, tools/domain.py |
+
+**Implementation approach:** Each step is an independent targeted edit in a single or two files. Steps 15.1-15.6 are production-hardening (fix real bugs and gaps). Steps 15.7-15.9 are code quality (no behavior change). All changes use existing libraries (httpx, psycopg, boto3). Zero new dependencies. No new DB tables. No new tools.
+
+**Zero new env vars beyond `SHOPIFY_API_VERSION`** (optional, has default `"2025-04"`). `SENDGRID_SENDER_EMAIL` was already in `.env` — just removing the hardcoded fallback.
+
+**Verification:** `uv run pytest -q` — 8 offline tests pass. Server starts, `/health` returns 200. 39 tools listed.
+
+### Phase 16: Production Deployment (6 steps) — NOT STARTED
+
+| Step | What | Files / Tools |
+|------|------|---------------|
+| 16.1 | **Restart server:** Kill old process, start fresh to pick up Phase 15 code. Verify health + 8 tests pass. | shell |
+| 16.2 | **Fly.io secrets:** Set all 21 env vars via `fly secrets set`. `BASE_URL`/`RESOURCE_URL` → `support-desk.fly.dev`. | fly CLI |
+| 16.3 | **Fly deploy:** `fly deploy` builds Docker image, launches VM. Verify health, well-known, MCP, admin dashboard respond. | fly CLI |
+| 16.4 | **Seed Neon DB:** Insert users (4), tickets (5), attachments (2), notification_config (1), user_state (4), config (2), config_history (2), ticket_notes (1). Idempotent `INSERT ... ON CONFLICT DO NOTHING`. | Neon SQL |
+| 16.5 | **Update Descope:** MCP Server URL → `support-desk.fly.dev/mcp`, App URL → `support-desk.fly.dev`, Approved Domains add `fly.dev`, DCR ON. | Descope console |
+| 16.6 | **End-to-end verification:** 25 tests covering auth, tickets, CSAT, search, attachments, multi-tenant, cross-chat memory, dashboard, Freshdesk sync, Shopify lookup, notifications. | curl + claude.ai |
+
+**Implementation approach:** Steps 16.1 (restart) and 16.2-16.3 (fly deploy) can run in parallel since they target different environments. Steps 16.4-16.6 are sequential dependencies (seed → verify). Dockerfile and fly.toml are already complete — zero code changes for deploy. All secrets already in `.env`.
+
+**Verification:** 25-point checklist. All Phase 15 hardening active. Fly.io machine healthy. Descope auth works end-to-end. Cross-chat memory persists.
+
 ---
 
 ## 5. Key Design Decisions
@@ -596,25 +681,15 @@ Use boto3's `generate_presigned_url` with `ClientMethod='get_object'`, `ExpiresI
 Credentials read from env vars: `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`, `R2_ENDPOINT`, `R2_BUCKET`.
 Endpoint URL format: `https://<accountid>.r2.cloudflarestorage.com`.
 
-### 5.3 FastMCP tools/list Role Filtering
+### 5.3 FastMCP tools/list Role Filtering (REMOVED)
 
-`tools/list` is an MCP protocol method, not a registered tool. FastMCP's
-`add_tool_transformation()` runs at registration time — it cannot filter per-request.
-Additionally, `tools/list` is called BEFORE `begin_session`, so there is no session token.
+Role-based tools/list filtering was originally planned as ASGI middleware, then removed entirely.
+All 39 tools are returned by `tools/list` to all authenticated users. Role enforcement at the
+tool level via `role_gate.py` — unauthorized callers receive `"not found"`. This is simpler,
+more reliable, and fails closed (tools return `"not found"` for unauthorized callers).
 
-**Approach — Starlette middleware on `/mcp`:**
-
-1. Mount a Starlette middleware or custom route handler wrapping the MCP app's mount
-2. For `POST /mcp` with JSON-RPC body `{"method": "tools/list"}`:
-   a. Extract the Descope JWT from the `Authorization` header (always sent by the client)
-   b. Decode it to get the `role` claim (uses `get_access_token()` → `claims.role`)
-   c. Call the original MCP handler to get the full tool list
-   d. Filter: `role="admin"` → all tools; `role="staff"` → customer+agent; `role=null` → customer only
-   e. Return the filtered list
-
-**Fallback:** If middleware is too fragile, rely on backend role gating alone — every tool
-already checks role on invocation and returns `"not found"` for unauthorized callers.
-The tools/list filtering is defense-in-depth, not the sole access control mechanism.
+The DescopeProvider's `scopes_supported=["mcp:read","mcp:write","admin","staff"]` configuration
+helps claude.ai's MCP client expose all tools to the model.
 
 ### 5.4 Freshdesk Status Mapping (spec lines 1331–1347)
 
@@ -652,8 +727,8 @@ period end are NOT counted.
 |---|-----------|---------------|
 | 1 | One gateway | All tools on same FastMCP instance. No second server. |
 | 2 | Tools only | No resources or prompts. Admin dashboard uses tools via fetch(). |
-| 3 | Prove, don't trust | All tools use `sub` from session token. No `user_id` parameter. `tools/list` filters by role. |
-| 4 | Fail closed | Every tool returns `_reminder`. Admin tools return "not found" for unauthorized callers. |
+| 3 | Prove, don't trust | All tools use `sub` from session token. No `user_id` parameter. Role from DB, not JWT claims. |
+| 4 | Fail closed | Every tool returns `_reminder`. Admin tools return `"not found"` for unauthorized callers. |
 
 ---
 
@@ -664,18 +739,21 @@ period end are NOT counted.
 | `server.py` | Role-gating fixes for 3 tools, `tools/list` filtering, `/health` route, admin route path fix, customer attach_file access |
 | `tools/domain.py` | 18 tool implementations — most need fixes per 3.3–3.21 above |
 | `tools/user.py` | `configure_notifications` validation + read-mode |
-| `tools/config.py` | validation, output format, actual credential storage |
-| `catalog.py` | field names, validation, pagination, admin-gate |
-| `notifications.py` | Fix webhook header name, creator-only filtering |
-| `sync.py` | Fix query scope, config store creds, FD status handling |
-| `role_gate.py` | Add `filter_tools_for_role()` function |
-| `admin/index.html` | No changes (already correct) |
-| `seed/tickets.json` | **New** — 5 sample tickets |
-| `seed/attachments.json` | **New** — 2 attachment rows |
-| `seed/notifications.json` | **New** — 1 notification config |
-| `Dockerfile` | **New** |
-| `fly.toml` | **New** |
-| `tests/test_starter.py` | Fix for `require_session` return type (already done) |
+| `tools/config.py` | validation, output format, actual credential storage, config_list_history |
+| `tools/admin.py` | **New** — 4 admin tools: list_users, set_user_role, list_all_tickets, get_dashboard_token |
+| `catalog.py` | field names, validation, pagination, admin-gate. **Phase 15: _get_embedding made public for import.** |
+| `notifications.py` | Fix webhook header name, creator-only filtering. **Phase 15: hardcoded sender removed.** |
+| `sync.py` | Fix query scope, config store creds, FD status handling. **Phase 15: retry + logging + _fd_creds made public.** |
+| `db.py` | **Phase 15: pool tuning — max_size=10, max_lifetime, reconnect_timeout.** |
+| `tools/domain.py` | 18 tool implementations. **Phase 15: Shopify creds/config, Freshdesk retry, SendGrid wiring, R2 removal, dedup imports.** |
+| `role_gate.py` | gate_admin/gate_staff helpers |
+| `admin/index.html` | Updated — full SPA with 6 sections, passphrase login, /mcp/admin proxy, localStorage + auto-refresh. **Phase 14 mobile-responsive done.** |
+| `seed/tickets.json` | 5 sample tickets (tkt-010 through tkt-014) |
+| `seed/attachments.json` | 2 attachment rows |
+| `seed/notifications.json` | 1 notification config |
+| `Dockerfile` | Container build (python:3.14-slim, uv) |
+| `fly.toml` | Fly.io deploy config |
+| `tests/test_starter.py` | 8/8 offline tests pass |
 
 ---
 
@@ -683,6 +761,9 @@ period end are NOT counted.
 
 After all phases:
 - `uv run pytest -q` — all 8 tests pass
-- `AUTH_DISABLED=1 uv run python -c "from connector_app.server import mcp..."` — all tools listed
+- `uv run python -c "from connector_app.server import mcp; asyncio.run(mcp.list_tools())"` — 39 tools listed
+- Dashboard loads at `/admin` with passphrase login, all 6 sections functional
+- Dashboard fully usable at 375px viewport (mobile) — no horizontal scroll, hamburger nav works
+- `/mcp/admin` proxy endpoint serves all registered admin tools
 - Spec acceptance criteria checked via manual curl/calls
 - `git log` shows one commit per step for clean rollback

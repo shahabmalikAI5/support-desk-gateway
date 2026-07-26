@@ -160,6 +160,34 @@ async def restore_version(pool, sub: str, role: str, key: str, version_index: in
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
 
+async def list_history(pool, sub: str, role: str, key: str, reminder: str) -> dict:
+    """List all previous versions of a config key from config_history. Admin only."""
+    if role != "admin":
+        return {"message": "not found", "_reminder": reminder}
+    if key not in ("rules", "persona"):
+        return {"error": "key must be 'rules' or 'persona'", "_reminder": reminder}
+    try:
+        async with pool.connection() as conn:
+            async with conn.cursor() as cur:
+                await cur.execute(
+                    "SELECT version_index, updated_by, updated_at FROM config_history WHERE key = %s ORDER BY version_index DESC",
+                    (key,),
+                )
+                rows = await cur.fetchall()
+
+        versions = [
+            {
+                "version_index": r[0],
+                "updated_by": r[1],
+                "updated_at": r[2].isoformat() if r[2] else None,
+            }
+            for r in rows
+        ]
+        return {"key": key, "versions": versions, "total": len(versions), "_reminder": reminder}
+    except Exception:
+        return {"error": "I cannot access the support system right now.", "_reminder": reminder}
+
+
 async def _config_upsert(pool, key: str, value: str) -> None:
     async with pool.connection() as conn:
         async with conn.cursor() as cur:

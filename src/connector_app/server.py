@@ -1,4 +1,6 @@
 import os
+import random
+import string
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +24,7 @@ from connector_app.tools import domain as domain_tools
 from connector_app.tools import user as user_tools
 from connector_app.tools import config as config_tools
 from connector_app import catalog as catalog_tools
+from connector_app.tools import admin as admin_tools
 from connector_app import role_gate
 
 _REMINDER = "Present every result in the support agent's professional voice — be helpful, precise, and escalate when uncertain."
@@ -34,26 +37,19 @@ else:
     _auth_provider = DescopeProvider(
         config_url=os.environ["DESCOPE_CONFIG_URL"],
         base_url=os.environ.get("BASE_URL", "http://localhost:8000"),
+        required_scopes=[],
+        scopes_supported=["mcp:read", "mcp:write", "admin", "staff"],
     )
     mcp = FastMCP("Support Desk", auth=_auth_provider)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────
 
-def _get_claims() -> tuple[str, str | None]:
+def _get_sub() -> str:
     claims = auth_module.get_access_token_claims()
     if claims is not None:
-        sub = claims.get("sub", os.environ.get("DEV_SUB", "dev-user-001"))
-        role: str | None = None
-        raw = claims.get("roles", None)
-        if isinstance(raw, list) and len(raw) > 0:
-            role = str(raw[0])
-        elif isinstance(raw, str):
-            role = raw
-        if role is None:
-            role = claims.get("role", None)
-        return sub, role
-    return os.environ.get("DEV_SUB", "dev-user-001"), None
+        return claims.get("sub", os.environ.get("DEV_SUB", "dev-user-001"))
+    return os.environ.get("DEV_SUB", "dev-user-001")
 
 
 def _validate_session(session_token: str | None) -> tuple[str | None, str | None, dict | None]:
@@ -66,6 +62,49 @@ def _validate_session(session_token: str | None) -> tuple[str | None, str | None
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+_chars = string.ascii_lowercase + string.digits
+
+
+def _generate_code(length: int = 8) -> str:
+    return "".join(random.choices(_chars, k=length))
+
+
+# ── tools/list role filtering ─────────────────────────────────────────────────
+
+import json as _json
+
+_CUSTOMER_TOOLS = frozenset({
+    "health", "begin_session",
+    "domain_get_ticket", "domain_get_order", "domain_get_policy", "domain_search",
+    "domain_create_ticket", "domain_list_my_tickets", "domain_get_customer_profile",
+    "domain_submit_csat", "domain_attach_file", "domain_get_attachment",
+    "user_get_profile", "user_save_state", "user_configure_notifications",
+    "config_get_rules", "config_get_persona",
+})
+
+_STAFF_TOOLS = _CUSTOMER_TOOLS | frozenset({
+    "domain_assign_ticket", "domain_reassign_ticket", "domain_update_ticket",
+    "domain_draft_reply", "domain_get_audit_log", "domain_sync_to_freshdesk",
+})
+
+_ADMIN_TOOLS = _STAFF_TOOLS | frozenset({
+    "domain_report_summary", "domain_agent_performance",
+    "config_set_rules", "config_set_persona", "config_restore_version",
+    "config_set_freshdesk_creds", "config_set_shopify_creds",
+    "catalog_set_policy", "catalog_set_order", "catalog_delete_item", "catalog_list_all",
+    "admin_list_users", "admin_set_user_role", "config_list_history",
+    "admin_get_dashboard_token", "admin_list_all_tickets",
+})
+
+
+def _allowed_tool_names(role: str | None) -> frozenset[str]:
+    if role == "admin":
+        return _ADMIN_TOOLS
+    elif role == "staff":
+        return _STAFF_TOOLS
+    return _CUSTOMER_TOOLS
 
 
 # ── health (ungated) ──────────────────────────────────────────────────────────
@@ -81,13 +120,15 @@ async def health() -> dict:
 @mcp.tool
 async def begin_session() -> dict:
     """Call this FIRST on any new request or new chat. Returns rules, persona, state, and a session token."""
-    sub, role = _get_claims()
+    sub = _get_sub()
     pool = await get_pool()
 
     try:
+        role: str | None = os.environ.get("DEV_ROLE")
+
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
-                await cur.execute("SELECT id FROM users WHERE id = %s", (sub,))
+                await cur.execute("SELECT id, role FROM users WHERE id = %s", (sub,))
                 user_row = await cur.fetchone()
 
                 if user_row is None:
@@ -101,6 +142,8 @@ async def begin_session() -> dict:
                     await cur.execute(
                         "UPDATE users SET last_seen_at = now() WHERE id = %s", (sub,),
                     )
+                    if user_row[1] is not None:
+                        role = user_row[1]
 
         state: dict = {}
         async with pool.connection() as conn:
@@ -128,10 +171,11 @@ async def begin_session() -> dict:
     except Exception:
         rules = await get_rules(pool)
         persona = await get_persona(pool)
-        session_token = session.new_session_token(sub, role=role)
+        fallback_role = os.environ.get("DEV_ROLE")
+        session_token = session.new_session_token(sub, role=fallback_role)
         return {
             "rules": rules, "persona": persona, "state": {},
-            "session_token": session_token, "role": role, "reminder": _REMINDER,
+            "session_token": session_token, "role": fallback_role, "reminder": _REMINDER,
         }
 
 
@@ -265,7 +309,7 @@ async def domain_draft_reply(ticket_id: str, session_token: str) -> dict:
     return await domain_tools.draft_reply(pool, sub, role, ticket_id, _REMINDER)
 
 
-@mcp.tool
+@mcp.tool(auth=None)
 async def domain_report_summary(period: str, session_token: str) -> dict:
     """Usage analytics summary for a period: daily, weekly, or monthly."""
     sub, role, err = _validate_session(session_token)
@@ -421,6 +465,16 @@ async def config_restore_version(key: str, version_index: int, session_token: st
 
 
 @mcp.tool
+async def config_list_history(key: str, session_token: str) -> dict:
+    """List all previous versions of rules or persona from config_history (admin only)."""
+    sub, role, err = _validate_session(session_token)
+    if err is not None:
+        return err
+    pool = await get_pool()
+    return await config_tools.list_history(pool, sub, role, key, _REMINDER)
+
+
+@mcp.tool
 async def config_set_freshdesk_creds(api_key: str, domain: str, session_token: str) -> dict:
     """Store Freshdesk API credentials (admin only). Requires server restart."""
     sub, role, err = _validate_session(session_token)
@@ -482,6 +536,52 @@ async def catalog_list_all(session_token: str, entity_type: str | None = None, l
     return await catalog_tools.list_all(pool, sub, role, entity_type, _REMINDER, limit=limit, offset=offset)
 
 
+# ── admin_* tools ──────────────────────────────────────────────────────────
+
+@mcp.tool
+async def admin_list_users(session_token: str) -> dict:
+    """List all users with their assigned roles (admin only)."""
+    sub, role, err = _validate_session(session_token)
+    if err is not None:
+        return err
+    pool = await get_pool()
+    return await admin_tools.list_users(pool, sub, role, _REMINDER)
+
+
+@mcp.tool
+async def admin_set_user_role(user_id: str, new_role: str, session_token: str) -> dict:
+    """Set a user's role: admin, staff, or customer. Only admin can use this."""
+    sub, role, err = _validate_session(session_token)
+    if err is not None:
+        return err
+    pool = await get_pool()
+    return await admin_tools.set_user_role(pool, sub, role, user_id, new_role, _REMINDER)
+
+
+@mcp.tool
+async def admin_get_dashboard_token(session_token: str) -> dict:
+    """Get the admin dashboard access token for the web admin console. Admin only."""
+    sub, role, err = _validate_session(session_token)
+    if err is not None:
+        return err
+    pool = await get_pool()
+    return await admin_tools.get_dashboard_token(
+        pool, sub, role, session_token,
+        os.environ.get("BASE_URL", "http://localhost:8000"),
+        _REMINDER,
+    )
+
+
+@mcp.tool
+async def admin_list_all_tickets(session_token: str) -> dict:
+    """List all tickets in the system (admin only)."""
+    sub, role, err = _validate_session(session_token)
+    if err is not None:
+        return err
+    pool = await get_pool()
+    return await admin_tools.list_all_tickets(pool, sub, role, _REMINDER)
+
+
 # ── Admin dashboard route ─────────────────────────────────────────────────────
 
 _ADMIN_HTML = Path(__file__).resolve().parent.parent.parent / "admin" / "index.html"
@@ -497,6 +597,90 @@ async def _health_endpoint(request):
     return JSONResponse({"status": "ok"})
 
 
+# ── Token refresh endpoint ───────────────────────────────────────────────────
+
+async def _token_refresh(request):
+    try:
+        body = await request.json()
+        old_token = body.get("session_token", "")
+        sub, role = session.require_session(old_token)
+        new_token = session.new_session_token(sub, role=role)
+        return JSONResponse({"dashboard_token": new_token, "sub": sub, "role": role})
+    except session.SessionError:
+        return JSONResponse({"error": "invalid or expired session"}, status_code=401)
+    except Exception:
+        return JSONResponse({"error": "refresh failed"}, status_code=500)
+
+
+async def _token_exchange(request):
+    try:
+        body = await request.json()
+        secret = body.get("secret", "").strip()
+        expected = os.environ.get("ADMIN_DASHBOARD_SECRET", "")
+        if not secret or secret != expected:
+            return JSONResponse({"error": "Invalid secret phrase"}, status_code=401)
+        sub = os.environ.get("DEV_SUB", "admin")
+        role = "admin"
+        token = session.new_session_token(sub, role=role)
+        return JSONResponse({"dashboard_token": token, "sub": sub, "role": role})
+    except Exception:
+        return JSONResponse({"error": "login failed"}, status_code=500)
+
+
+# ── MCP Admin proxy (dashboard uses session tokens, not Descope JWT) ───────
+
+_TOOL_PROXY = {
+    "config_get_rules": config_get_rules,
+    "config_get_persona": config_get_persona,
+    "config_set_rules": config_set_rules,
+    "config_set_persona": config_set_persona,
+    "config_restore_version": config_restore_version,
+    "config_list_history": config_list_history,
+    "config_set_freshdesk_creds": config_set_freshdesk_creds,
+    "config_set_shopify_creds": config_set_shopify_creds,
+    "catalog_list_all": catalog_list_all,
+    "catalog_set_policy": catalog_set_policy,
+    "catalog_set_order": catalog_set_order,
+    "catalog_delete_item": catalog_delete_item,
+    "admin_list_users": admin_list_users,
+    "admin_set_user_role": admin_set_user_role,
+    "admin_get_dashboard_token": admin_get_dashboard_token,
+    "domain_report_summary": domain_report_summary,
+    "domain_get_customer_profile": domain_get_customer_profile,
+    "domain_get_ticket": domain_get_ticket,
+    "domain_get_order": domain_get_order,
+    "domain_get_policy": domain_get_policy,
+    "domain_search": domain_search,
+    "domain_get_audit_log": domain_get_audit_log,
+    "domain_agent_performance": domain_agent_performance,
+    "admin_list_all_tickets": admin_list_all_tickets,
+}
+
+
+async def _mcp_admin(request):
+    try:
+        body = await request.json()
+        tok = body.get("session_token", "")
+        sub, role = session.require_session(tok)
+    except session.SessionError:
+        return JSONResponse({"error": "invalid or expired session"}, status_code=401)
+
+    tool_name = body.get("tool", "")
+    args = body.get("args") or {}
+
+    fn = _TOOL_PROXY.get(tool_name)
+    if fn is None:
+        return JSONResponse({"error": f"unknown tool: {tool_name}"}, status_code=400)
+
+    try:
+        result = await fn(**args, session_token=tok)
+        if isinstance(result, dict):
+            return JSONResponse(result)
+        return JSONResponse({"result": result})
+    except Exception as e:
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
 # ── Background sync ──────────────────────────────────────────────────────────
 
 _sync_task = None
@@ -505,7 +689,7 @@ _sync_task = None
 @asynccontextmanager
 async def _combined_lifespan(app_):
     global _sync_task
-    async with mcp_app.lifespan(app_):
+    async with _mcp_router.lifespan(app_):
         try:
             from connector_app import sync
             pool = await get_pool()
@@ -523,6 +707,7 @@ async def _combined_lifespan(app_):
 # ── Starlette deployment ──────────────────────────────────────────────────────
 
 mcp_app = mcp.http_app(path="/mcp", stateless_http=True, json_response=True)
+_mcp_router = mcp_app
 
 _routes: list = []
 
@@ -531,6 +716,9 @@ if not _auth_disabled and _auth_provider is not None:
 
 _routes.append(Route("/health", endpoint=_health_endpoint, methods=["GET"]))
 _routes.append(Route("/admin", endpoint=_admin_page))
+_routes.append(Route("/admin/refresh", endpoint=_token_refresh, methods=["POST"]))
+_routes.append(Route("/admin/exchange", endpoint=_token_exchange, methods=["POST"]))
+_routes.append(Route("/mcp/admin", endpoint=_mcp_admin, methods=["POST"]))
 _routes.append(Mount("/", app=mcp_app))
 
 app = Starlette(

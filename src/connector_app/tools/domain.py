@@ -1,5 +1,6 @@
 """domain_* tool implementations — all DB logic lives here, not in server.py."""
 
+import asyncio
 import os
 import uuid
 from datetime import datetime, timezone
@@ -7,27 +8,15 @@ from datetime import datetime, timezone
 import httpx
 from psycopg.types.json import Jsonb
 
+from connector_app.catalog import get_embedding
+from connector_app.sync import get_fd_creds
+
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-async def _get_embedding(text: str) -> list[float] | None:
-    api_key = os.environ.get("MISTRAL_API_KEY")
-    if not api_key or not text:
-        return None
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                "https://api.mistral.ai/v1/embeddings",
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
-                json={"model": "mistral-embed", "input": [text]},
-                timeout=30.0,
-            )
-            resp.raise_for_status()
-            return resp.json()["data"][0]["embedding"]
-    except Exception:
-        return None
+# get_embedding is imported from connector_app.catalog as get_embedding
 
 
 async def log_audit(pool, user_id: str, tool_name: str, input_summary: str, output_summary: str) -> None:
@@ -107,12 +96,26 @@ async def get_order(pool, sub: str, id: str, reminder: str) -> dict:
 
         shop_token = os.environ.get("SHOPIFY_ACCESS_TOKEN")
         shop_domain = os.environ.get("SHOPIFY_STORE_DOMAIN")
+        api_version = os.environ.get("SHOPIFY_API_VERSION", "2025-04")
+        try:
+            async with pool.connection() as c2:
+                async with c2.cursor() as cur2:
+                    await cur2.execute("SELECT value FROM config WHERE key = 'shopify_access_token'")
+                    ct = await cur2.fetchone()
+                    if ct:
+                        shop_token = ct[0]
+                    await cur2.execute("SELECT value FROM config WHERE key = 'shopify_store_domain'")
+                    cd = await cur2.fetchone()
+                    if cd:
+                        shop_domain = cd[0]
+        except Exception:
+            pass
         if not shop_token or not shop_domain:
-            return {"message": "not found", "_reminder": reminder}
+            return {"error": "Shopify not configured", "_reminder": reminder}
 
         async with httpx.AsyncClient() as client:
             resp = await client.get(
-                f"https://{shop_domain}/admin/api/2024-07/orders/{id}.json",
+                f"https://{shop_domain}/admin/api/{api_version}/orders/{id}.json",
                 headers={"X-Shopify-Access-Token": shop_token},
                 timeout=10.0,
             )
@@ -168,7 +171,7 @@ async def search(pool, sub: str, query: str, reminder: str, *, include_my_ticket
         return {"error": "Search temporarily unavailable.", "_reminder": reminder}
 
     try:
-        embedding = await _get_embedding(query)
+        embedding = await get_embedding(query)
         if embedding is None:
             return {"error": "Search temporarily unavailable.", "_reminder": reminder}
 
@@ -235,7 +238,7 @@ async def create_ticket(pool, sub: str, subject: str, body: str, priority: str, 
                 )
                 row = await cur.fetchone()
 
-        embedding = await _get_embedding(f"{subject.strip()} {body.strip()}")
+        embedding = await get_embedding(f"{subject.strip()} {body.strip()}")
         ticket_content = {"subject": subject.strip(), "body": body.strip(), "created_by": sub}
         async with pool.connection() as conn:
             async with conn.cursor() as cur:
@@ -594,6 +597,11 @@ async def submit_csat(pool, sub: str, ticket_id: str, score: int, reminder: str)
                     (score, now_ts, now_ts, now_ts, ticket_id),
                 )
         await log_audit(pool, sub, "domain_submit_csat", f"ticket={ticket_id},score={score}", "submitted")
+        try:
+            from connector_app.notifications import dispatch
+            await dispatch(ticket_id, "resolution", row[2], pool)
+        except Exception:
+            pass
         return {"status": "submitted", "csat_score": score, "_reminder": reminder}
     except Exception:
         return {"error": "I cannot access the support system right now.", "_reminder": reminder}
@@ -965,6 +973,8 @@ async def attach_file(pool, sub: str, role: str, ticket_id: str, file_name: str,
         r2_key = f"{ticket_id}/{uuid.uuid4().hex[:8]}-{file_name}"
         stored = await _store_file(r2_key, raw_bytes)
         if not stored:
+            if _r2_client() is None:
+                return {"error": "Attachment storage not configured. Contact your administrator.", "_reminder": reminder}
             return {"error": "I cannot access the support system right now.", "_reminder": reminder}
 
         attachment_id = f"att-{uuid.uuid4().hex[:8]}"
@@ -1011,18 +1021,6 @@ async def get_attachment(pool, sub: str, attachment_id: str, reminder: str, *, r
                 url_expires_at = datetime.fromtimestamp(expires_at, tz=timezone.utc).isoformat()
 
         presigned_url = await _presigned_url(r2_key)
-        if presigned_url is None and r2_key in _ATTACHMENT_STORE:
-            import base64
-            await log_audit(pool, sub, "domain_get_attachment", f"attachment={attachment_id}", "retrieved (memory)")
-            return {
-                "attachment_id": row[0], "ticket_id": row[1], "file_name": row[2],
-                "mime_type": row[3], "size_bytes": row[4],
-                "file_data": base64.b64encode(_ATTACHMENT_STORE[r2_key]).decode(),
-                "uploaded_by": row[6],
-                "uploaded_at": row[7].isoformat() if row[7] else None,
-                "url_expires_at": url_expires_at,
-                "_reminder": reminder,
-            }
         await log_audit(pool, sub, "domain_get_attachment", f"attachment={attachment_id}", "retrieved")
         return {
             "attachment_id": row[0], "ticket_id": row[1], "file_name": row[2],
@@ -1044,37 +1042,28 @@ _FD_PRIORITY_MAP = {"critical": 4, "high": 3, "medium": 2, "low": 1}
 _FD_STATUS_REVERSE = {3: "pending", 4: "resolved", 5: "closed"}
 _FD_PRIORITY_REVERSE = {4: "critical", 3: "high", 2: "medium", 1: "low"}
 
-
-async def _fd_creds(pool) -> tuple[str | None, str | None]:
-    """Read Freshdesk credentials from config store, fall back to env vars."""
-    try:
-        async with pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT value FROM config WHERE key = 'freshdesk_api_key'")
-                r1 = await cur.fetchone()
-                await cur.execute("SELECT value FROM config WHERE key = 'freshdesk_domain'")
-                r2 = await cur.fetchone()
-                if r1 and r2:
-                    return r1[0], r2[0]
-    except Exception:
-        pass
-    return os.environ.get("FRESHDESK_API_KEY"), os.environ.get("FRESHDESK_DOMAIN")
-
+# getget_fd_creds is imported from connector_app.sync
 
 async def _fd_request(method: str, path: str, api_key: str, domain: str, json_body: dict | None = None) -> dict | None:
-    """Make a Freshdesk API request. Returns parsed JSON or None on failure."""
+    """Make a Freshdesk API request with retry. Returns parsed JSON or None on failure."""
     auth = httpx.BasicAuth(api_key, "X")
     url = f"https://{domain}.freshdesk.com/api/v2{path}"
-    try:
-        async with httpx.AsyncClient() as client:
-            resp = await client.request(method, url, auth=auth, json=json_body, timeout=15.0)
-            if resp.status_code in (200, 201):
-                return resp.json()
-            return None
-    except Exception:
-        return None
-    except Exception:
-        return None
+    last_exc = None
+    for attempt in range(3):
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.request(method, url, auth=auth, json=json_body, timeout=15.0)
+                if resp.status_code in (200, 201):
+                    return resp.json()
+                print(f"[freshdesk] {method} {url} → HTTP {resp.status_code} (attempt {attempt+1}/3)", flush=True)
+                last_exc = f"HTTP {resp.status_code}"
+        except Exception as e:
+            print(f"[freshdesk] {method} {url} → {e} (attempt {attempt+1}/3)", flush=True)
+            last_exc = str(e)
+        if attempt < 2:
+            await asyncio.sleep(2 ** attempt)
+    print(f"[freshdesk] {method} {url} FAILED after 3 retries: {last_exc}", flush=True)
+    return None
 
 
 async def sync_to_freshdesk(pool, sub: str, role: str, ticket_id: str, action: str, reminder: str) -> dict:
@@ -1083,7 +1072,7 @@ async def sync_to_freshdesk(pool, sub: str, role: str, ticket_id: str, action: s
         return {"message": "not found", "_reminder": reminder}
     if action not in ("push", "pull", "sync_bi"):
         return {"error": "action must be one of: push, pull, sync_bi", "_reminder": reminder}
-    api_key, domain = await _fd_creds(pool)
+    api_key, domain = await get_fd_creds(pool)
     if not api_key or not domain:
         return {"error": "Freshdesk not configured", "_reminder": reminder}
 
@@ -1169,8 +1158,6 @@ async def sync_to_freshdesk(pool, sub: str, role: str, ticket_id: str, action: s
 
 # ── Internal helpers ─────────────────────────────────────────────────────────
 
-_ATTACHMENT_STORE: dict[str, bytes] = {}
-
 
 def _r2_client():
     """Create a boto3 S3 client for Cloudflare R2. Returns None if not configured."""
@@ -1189,40 +1176,37 @@ def _r2_client():
 
 
 async def _store_file(r2_key: str, raw_bytes: bytes) -> bool:
-    """Upload bytes to R2. Falls back to in-memory store. Returns True on success."""
+    """Upload bytes to R2. Returns True on success, False on failure."""
     client = _r2_client()
-    if client is not None:
-        bucket = os.environ.get("R2_BUCKET", "support-desk-attachments")
-        try:
-            import asyncio
-            loop = asyncio.get_running_loop()
-            await loop.run_in_executor(
-                None, lambda: client.put_object(Bucket=bucket, Key=r2_key, Body=raw_bytes)
-            )
-            return True
-        except Exception:
-            return False
-    _ATTACHMENT_STORE[r2_key] = raw_bytes
-    return True
+    if client is None:
+        return False
+    bucket = os.environ.get("R2_BUCKET", "support-desk-attachments")
+    try:
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, lambda: client.put_object(Bucket=bucket, Key=r2_key, Body=raw_bytes)
+        )
+        return True
+    except Exception:
+        return False
 
 
 async def _presigned_url(r2_key: str, expires_in: int = 900) -> str | None:
-    """Generate a presigned GET URL from R2. Falls back to None."""
+    """Generate a presigned GET URL from R2. Returns None if R2 not configured or on failure."""
     client = _r2_client()
-    if client is not None:
-        bucket = os.environ.get("R2_BUCKET", "support-desk-attachments")
-        try:
-            import asyncio
-            loop = asyncio.get_running_loop()
-            url = await loop.run_in_executor(
-                None,
-                lambda: client.generate_presigned_url(
-                    "get_object",
-                    Params={"Bucket": bucket, "Key": r2_key},
-                    ExpiresIn=expires_in,
-                ),
-            )
-            return url
-        except Exception:
-            return None
-    return None
+    if client is None:
+        return None
+    bucket = os.environ.get("R2_BUCKET", "support-desk-attachments")
+    try:
+        loop = asyncio.get_running_loop()
+        url = await loop.run_in_executor(
+            None,
+            lambda: client.generate_presigned_url(
+                "get_object",
+                Params={"Bucket": bucket, "Key": r2_key},
+                ExpiresIn=expires_in,
+            ),
+        )
+        return url
+    except Exception:
+        return None

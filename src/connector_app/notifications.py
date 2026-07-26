@@ -12,13 +12,17 @@ def _now_iso() -> str:
 
 _WEBHOOK_SECRET = os.environ.get("WEBHOOK_SECRET", "")
 _SENDGRID_API_KEY = os.environ.get("SENDGRID_API_KEY", "")
-_SENDER_EMAIL = os.environ.get("SENDGRID_SENDER_EMAIL", "shahabmalikAI5@gmail.com")
+_SENDER_EMAIL = os.environ.get("SENDGRID_SENDER_EMAIL")
 _SENDER_NAME = os.environ.get("SENDGRID_SENDER_NAME", "Support Desk")
 
 
 async def send_email(to_email: str, subject: str, body: str) -> bool:
     """Send a transactional email via SendGrid REST API. Returns True on success."""
     if not _SENDGRID_API_KEY:
+        return False
+    if not _SENDER_EMAIL:
+        import sys
+        print(f"[notifications] SENDGRID_SENDER_EMAIL not set; email disabled", file=sys.stderr)
         return False
     try:
         import httpx

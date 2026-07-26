@@ -269,25 +269,53 @@ content via `domain_get_policy` after save.
 fail (rejecting the status change because email failed). Or the rate limit error is surfaced
 to the customer as a tool error message. Or emails silently drop without any logging.
 
+### v2 Scenario 15: Admin onboards a new support agent
+
+> A new support agent, Marcus, signs in via Descope for the first time. His `sub` is auto-created
+> in the `users` table with `role = NULL` (customer access only). Shahab (admin) opens his AI
+> assistant and says: *"List all users and their roles."*
+
+The AI calls `admin_list_users` → returns all users with their roles and last-seen timestamps.
+Shahab asks: *"Make Marcus a staff agent."* The AI calls `admin_set_user_role("U3Gxxx", "staff")`.
+The response confirms: `{"status": "updated", "user_id": "U3Gxxx", "previous_role": null, "new_role": "staff"}`.
+
+> Marcus's next `begin_session` reads `role = 'staff'` from the DB. He now sees 22 tools in
+> `tools/list` — customer tools plus staff tools: ticket assignment, draft replies, and audit log
+> access. He can begin handling support tickets immediately.
+
+Alternatively, Shahab opens the admin dashboard at `https://<tunnel>/admin`, pastes his session
+token, and uses the User Management table to change Marcus's role via a dropdown — no SQL, no
+console.
+
+**Visible failure if broken:** `admin_set_user_role` rejects a valid user ID. Role change doesn't
+take effect on next `begin_session`. Staff agent still sees only customer tools. Non-admin user
+can call `admin_set_user_role` and elevate their own role.
+
 ---
 
 ## Access Control (Role Gating)
 
-The support desk has three roles, all managed through Descope user metadata. The role is set as
-a custom claim in the Descope JWT, verified by `auth.py` alongside `sub`, and embedded in the
-session token by `begin_session`. The role claim is HMAC-signed — tampering invalidates the token.
+The support desk has three roles, managed through the `users.role` column in the database.
+The role is NOT extracted from the Descope JWT — only `sub` (identity) comes from the verified
+OAuth token. The role is looked up from `users.role` during `begin_session` and embedded in the
+session token (HMAC-signed — tampering invalidates the token). Admin users can manage roles via
+`admin_list_users` / `admin_set_user_role` tools or the admin dashboard at `/admin`.
 
 ```
-Descope Dashboard → User → Metadata → { "role": "admin" | "staff" | <absent> }
-                         │
-                         ▼
-Descope JWT claims: { "sub": "...", "role": "admin"|"staff", ... }
-                         │
-                         ▼
-auth.py verifies JWT → exposes full claims dictionary
-                         │
-                         ▼
-begin_session() copies role into session token
+Descope JWT → verified by DescopeProvider → sub extracted
+                          │
+                          ▼
+begin_session() → SELECT role FROM users WHERE id = sub
+                          │
+                          ▼
+session token embeds: { sub, role, exp, scope }
+                          │
+                          ▼
+Every domain_*/user_*/config_* tool validates session token → reads sub + role
+                          │
+                          ▼
+role_gate.py → admin/staff/customer enforcement
+```
                          │
          ┌───────────────▼───────────────┐
          │ role == "admin"?  → All tools │
@@ -298,11 +326,11 @@ begin_session() copies role into session token
 
 ### Role Definitions
 
-| Role | Descope Metadata | Description |
-|------|-----------------|-------------|
-| **Admin** | `{ "role": "admin" }` | Full access — all customer, agent, and admin tools. Manages rules, persona, policies, catalog items, reports, and platform credentials. |
-| **Staff / Agent** | `{ "role": "staff" }` | Support agent — customer-facing tools + agent tools (assign, draft, reassign, audit log, attachment access). Cannot edit catalog, config, or platform credentials. Cannot see reports. |
-| **Customer** | role absent / null | End user — creates and views own tickets, searches catalog, submits CSAT, attaches files, configures notifications. Cannot access agent or admin tools. |
+| Role | Database (`users.role`) | Description |
+|------|------------------------|-------------|
+| **Admin** | `admin` | Full access — all tools. Manages rules, persona, policies, catalog, reports, platform credentials, and user roles. |
+| **Staff / Agent** | `staff` | Support agent — customer-facing + agent tools (assign, draft, reassign, audit log, attachments). Cannot edit catalog, config, reports, or user roles. |
+| **Customer** | `NULL` / absent | End user — creates/views own tickets, searches catalog, submits CSAT, attaches files, configures notifications. Cannot access agent or admin tools. |
 
 ### Tool Gating Matrix
 
@@ -338,37 +366,43 @@ begin_session() copies role into session token
 | `catalog_list_all` | — | — | ✓ |
 | `config_set_freshdesk_creds` | — | — | ✓ |
 | `config_set_shopify_creds` | — | — | ✓ |
+| `admin_list_users` | — | — | ✓ |
+| `admin_set_user_role` | — | — | ✓ |
 
 ### Admin Tool Gating Rules
 
-**Key rule:** A non-admin calling an admin-only tool receives the exact same response as calling a
-non-existent tool: `"not found"`. The response must NOT distinguish "this tool exists but you're
-not authorized" from "this tool doesn't exist." The tool's name, description, and existence are
-invisible to non-admin callers. The AI model never sees admin tools in a non-admin's session —
-they are excluded from tool discovery (the MCP `tools/list` response must omit admin tools for
-non-admin sessions, and both admin and agent tools for customer sessions).
+**Key rule:** A non-admin calling an admin-only tool receives `"not found"` — identical to calling a
+non-existent tool. The response must NOT distinguish "this tool exists but you're
+not authorized" from "this tool doesn't exist." Per-tool role gates in `role_gate.py` enforce this.
 
-**Session token role caching:** The role is extracted from the Descope JWT on every `begin_session`
-call, embedded in the session token, and cached for the session duration (30 min). This means:
+**Session token role caching:** The role is read from `users.role` during every `begin_session`,
+embedded in the session token, and cached for the session duration (30 min). This means:
 
-- **Adding a role:** Go to Descope Dashboard → Users → select the user → User Metadata → set
-  `{ "role": "admin" }` or `{ "role": "staff" }`. Next `begin_session` picks up the new role.
-- **Removing a role:** Delete the `role` metadata field. Next `begin_session` → role is null →
-  tool list shrinks to customer tier.
-- **Role change delay:** Active sessions with the old role remain valid until their session token
-  expires (30 min). Role changes are not real-time — they take effect on the next `begin_session`.
+- **Granting a role:** Admin calls `admin_set_user_role(user_id, "staff")` or uses the dashboard.
+  Next `begin_session` reads the new role from DB.
+- **Revoking a role:** Admin calls `admin_set_user_role(user_id, "customer")`. Next `begin_session`
+  → role = NULL → tool access shrinks to customer tier.
+- **Role change delay:** Active sessions with the old role remain valid until session token expires
+  (30 min). Role changes take effect on the next `begin_session`.
 - **Session token tampering:** If the `role` claim in the session token is modified, the HMAC
   signature becomes invalid and `require_session` rejects the token.
 
-### Setting Up Roles in Descope Dashboard
+### Setting Up Roles
 
-**Step-by-step:**
-1. Log into [Descope Console](https://app.descope.com) → select your project.
-2. Navigate to **Authorization** → **Users** → find the user in the list or search by email.
-3. Click the user row to open their profile.
-4. Scroll to **User Metadata** → click **Add**.
-5. Enter key: `role`, value: `admin` (for full access) or `staff` (for agent access).
-6. Click **Save**. No code change, no deploy, no database migration needed.
+**Via AI Chat (admin only):**
+```
+"List all users and their roles"
+"Make user U3Gxxx a support agent"
+```
+
+Calls `admin_list_users` and `admin_set_user_role` — no SQL, no console.
+
+**Via Admin Dashboard:**
+1. Open `https://<tunnel>/admin` in browser
+2. Paste your session token (from `begin_session` output or `user_get_profile`)
+3. Click "Refresh" under User Management
+4. Use the role dropdown to set admin/staff/customer
+5. Click "Set" — change takes effect on user's next `begin_session`
 7. The user's next `begin_session` call picks up the new role.
 
 **Removing a role:** Delete the `role` key from User Metadata, or set value to an empty string.
@@ -1174,72 +1208,216 @@ Fly secret defaults. `domain_get_order` uses these credentials for live order lo
 
 **Requires sign-in:** Yes.
 **Requires session:** Yes.
-**Requires role:** `admin` in Descope user metadata.
+**Requires role:** `admin` in `users.role` column.
+
+---
+
+#### `admin_list_users`
+
+**What it does:** Lists all registered users with their roles, emails, and timestamps. Admin-only.
+The calling admin's own `sub` is included in the list so they can identify themselves.
+
+**Input:** None besides session_token (implicit identity).
+
+**Output:**
+```json
+{
+  "users": [
+    {
+      "id": "U3GyvWQnot1EDb9MoVGPtB9IqHEx",
+      "email": null,
+      "role": "admin",
+      "created_at": "2026-07-25T05:21:31Z",
+      "last_seen_at": "2026-07-25T07:18:21Z"
+    }
+  ],
+  "total": 1
+}
+```
+
+**Behavior:**
+- `SELECT id, email, role, created_at, last_seen_at FROM users ORDER BY last_seen_at DESC`
+- Returns all users. No pagination needed (typically < 100 users).
+- Audit logged with count.
+
+**Requires sign-in:** Yes.
+**Requires session:** Yes.
+**Requires role:** `admin` in `users.role` column.
+
+---
+
+#### `admin_set_user_role`
+
+**What it does:** Sets or changes a user's role. Admin-only. Takes effect on the user's next
+`begin_session` call.
+
+**Input:**
+- `user_id` (string, required): The Descope `sub` of the user to update.
+- `new_role` (string, required): One of `"admin"`, `"staff"`, or `"customer"`.
+
+**Output:**
+```json
+{
+  "status": "updated",
+  "user_id": "U3Gxxx",
+  "previous_role": null,
+  "new_role": "staff",
+  "updated_at": "2026-07-25T08:00:00Z"
+}
+```
+
+**Behavior:**
+- `SELECT id, role FROM users WHERE id = user_id` — if not found, returns error with guidance:
+  `"user not found — they must connect at least once before a role can be assigned"`
+- `customer` role → sets `role = NULL` in DB (equivalent to no special access)
+- `UPDATE users SET role = new_role WHERE id = user_id`
+- Audit logged with `user_id`, `old_role`, `new_role`.
+
+**Validation:**
+- Empty user_id → `"user_id is required"`
+- Invalid new_role → `"new_role must be one of: admin, staff, customer"`
+- User not in DB → error with guidance text
+
+**Requires sign-in:** Yes.
+**Requires session:** Yes.
+**Requires role:** `admin` in `users.role` column.
+
+---
+
+#### `admin_list_all_tickets`
+
+**What it does:** Lists all tickets in the system with subject, priority, status, category, and
+created date. Admin-only. Used by the admin dashboard Tickets section.
+
+**Input:** None besides `session_token` (implicit identity).
+
+**Output:**
+```json
+{
+  "tickets": [
+    {
+      "id": "tkt-001",
+      "subject": "Overcharged on subscription",
+      "priority": "high",
+      "status": "open",
+      "category": "billing",
+      "created_by": "user-alice-42",
+      "created_at": "2026-07-20T14:15:00Z"
+    }
+  ],
+  "total": 27
+}
+```
+
+**Behavior:**
+- `SELECT ... FROM tickets ORDER BY created_at DESC LIMIT 50`
+- Returns up to 50 most recent tickets. Not paginated.
+
+**Requires sign-in:** Yes.
+**Requires session:** Yes.
+**Requires role:** `admin` in `users.role` column.
+
+---
+
+#### `config_list_history`
+
+**What it does:** Lists all previous versions of a config key (rules or persona) from the
+`config_history` table. Admin-only. Used by the dashboard history dropdowns.
+
+**Input:** `key` (string, required): `"rules"` or `"persona"`.
+
+**Output:** `{"key": "rules", "versions": [{version_index, updated_by, updated_at}], "total": N}`
+
+**Requires sign-in:** Yes.
+**Requires session:** Yes.
+**Requires role:** `admin` in `users.role` column.
+
+---
+
+#### `admin_get_dashboard_token`
+
+**What it does:** Generates a time-limited dashboard access code stored in the `admin_codes`
+table. Admin-only. The model relays the code to the user for dashboard login.
+
+**Output:** `{"dashboard_url": "...", "access_code": "a7k3m9x1", "display_instruction": "..."}`
+
+**Behavior:** Generates 8-char code, `INSERT INTO admin_codes` with 60s TTL. Dashboard exchanges
+code for session token via `/admin/exchange`.
+
+**Requires sign-in:** Yes.
+**Requires session:** Yes.
+**Requires role:** `admin` in `users.role` column.
 
 ---
 
 ## Admin Dashboard (Web Interface, v2)
 
-The admin dashboard provides a web-form alternative to AI chat for bulk editing and side-by-side
-review. It is a single static HTML page served from the same Starlette application at `/admin`,
-gated by the same Descope sign-in and `role: "admin"` check. It calls the same admin MCP tools
-(`config_set_*`, `catalog_set_*`, `catalog_delete_item`, `catalog_list_all`, `config_restore_version`)
-via fetch(), so all business logic lives in the tools — the dashboard is a thin UI shell.
+The admin dashboard provides a web-form alternative to AI chat for editing and review.
+It is a single static HTML page served from the same Starlette application at `/admin`,
+authenticated via a shared passphrase (`ADMIN_DASHBOARD_SECRET` from `.env`). It calls
+admin MCP tools via a dedicated proxy endpoint (`POST /mcp/admin`) that validates
+dashboard session tokens (HS256) instead of Descope OAuth JWT tokens.
 
 ### Architecture
 
 ```
 Browser ──GET /admin──▶ Starlette ──serve admin.html──▶ Dashboard loads
    │                                                        │
-   │  1. JS calls Descope sign-in (same OAuth flow as MCP)  │
-   │  2. JS calls begin_session → gets role + session_token │
-   │  3. If role != "admin" → show "Access denied"          │
-   │  4. If role == "admin" → render editors                │
+   │  1. User enters ADMIN_DASHBOARD_SECRET passphrase      │
+   │  2. POST /admin/exchange {secret} → returns token      │
+   │  3. Token stored in localStorage                       │
    │                                                        │
-   │  Edit → Save → JS calls catalog_set_policy(...)        │
-   │          with session_token as parameter                │
-   │          → tool updates DB + re-embeds                 │
+   │  All tool calls → POST /mcp/admin                     │
+   │    {session_token, tool, args}                         │
+   │    → Server validates HS256 token                      │
+   │    → Calls actual tool function                        │
+   │    → Returns result                                    │
+   │                                                        │
+   │  Token auto-refreshed every 25 min                     │
+   │  via POST /admin/refresh                               │
    ▼                                                        ▼
-Same FastMCP tools ──── Same Neon DB ──── Same Descope auth
+Same FastMCP tool implementations ──── Same Neon DB
 ```
 
 ### Sections
 
 | Section | What admin can do | Backend tool called |
 |---|---|---|
-| **Rules editor** | Textarea pre-filled with current rules. Edit text → Save button. "History" button toggles a dropdown showing previous versions with timestamps — click a version to restore it (calls `config_restore_version`). | `config_set_rules(text)`, `config_restore_version(key, version_index)` |
-| **Persona editor** | Same pattern — textarea, edit, save. History dropdown for previous versions with restore. | `config_set_persona(text)`, `config_restore_version(key, version_index)` |
-| **Policy table** | Table: ID, Title, "applies_to", last updated. Click row → inline edit. Delete button per row with confirmation. "Add new policy" button at top. Rows fetched via `catalog_list_all`. | `catalog_set_policy(id, title, body, applies_to)`, `catalog_delete_item(id)`, `catalog_list_all(entity_type)` |
-| **Order table (seed)** | Same CRUD pattern for seed orders. Collapsed by default, toggle to show | `catalog_set_order(id, content)`, `catalog_delete_item(id)` |
-| **Sync status bar (v3)** | Read-only: "Last Freshdesk sync: 2 min ago. 3 tickets synced. 0 errors." | Reads sync status from server |
-| **Sign out** | Clear session, return to login screen | No backend call — client-side only |
+| **Rules editor** | Textarea pre-filled with current rules. Edit text → Save button. History dropdown: select version → click Restore (calls `config_restore_version`). | `config_get_rules`, `config_set_rules`, `config_list_history`, `config_restore_version` |
+| **Persona editor** | Same pattern — textarea, edit, save. History dropdown with restore. | `config_get_persona`, `config_set_persona`, `config_list_history`, `config_restore_version` |
+| **Tickets table** | Table: ID, subject, priority, status, category, created date. Refresh via `admin_list_all_tickets`. | `admin_list_all_tickets` |
+| **Policy table** | Table: ID, Title, Applies To. Add New form. Inline edit via prompt(). Delete with confirmation. | `catalog_set_policy`, `catalog_delete_item`, `catalog_list_all` |
+| **Order table** | Same CRUD pattern: table + Add form (ID, customer, items JSON, total, status). Delete with confirmation. | `catalog_set_order`, `catalog_delete_item`, `catalog_list_all` |
+| **User management** | Table: User ID, email, role badge, last seen. Per-row role dropdown + Set button. | `admin_list_users`, `admin_set_user_role` |
+| **Dashboard home** | 5 metric cards (total tickets, open, SLA breaches, CSAT, resolution). 4 overview panels (Tickets, Orders, Policies, Users counts — clickable to navigate). Weekly summary table. | `domain_get_customer_profile`, `domain_report_summary`, `admin_list_users`, `catalog_list_all` |
+| **Sign out** | Clear session, return to login screen | Client-side only |
 
 ### Behavior
 
-- **Load:** Dashboard JS calls `begin_session` via the MCP endpoint → extracts `role` and
-  `session_token`. If role is not `"admin"`, displays "Access denied. Your account does not have
-  admin permissions." and renders nothing else. If role is `"admin"`, fetches current rules,
-  persona, and catalog items from the DB and populates each section.
-- **Edit → Save:** JS calls the appropriate admin tool with the session token as a parameter.
-  Each tool returns `{"status": "updated"}` on success. Dashboard displays a green confirmation
-  toast for 3 seconds, then refreshes the relevant section from the DB. If the tool returns an
-  error, dashboard displays the error message in red inline next to the field.
-- **Delete:** Confirmation dialog ("Delete pol-003? This cannot be undone.") → on confirm,
-  calls `catalog_delete_item` → removes the row from the table.
-- **Add:** "Add new policy" button opens a blank inline form → fill ID, title, body, applies_to →
-  Save → calls `catalog_set_policy` → new row appears in table, auto-re-embedded.
-- **No caching:** Every page load fetches fresh state from the DB. No browser cache, no
-  server-side cache.
+- **Login:** Dashboard displays a passphrase field. User enters `ADMIN_DASHBOARD_SECRET` from `.env`.
+  Dashboard calls `POST /admin/exchange` → server validates passphrase, issues HS256 session token
+  with `role="admin"`. Token stored in `localStorage` — persists across browser restarts.
+- **Auto-refresh:** Dashboard auto-refreshes the session token every 25 minutes via `POST /admin/refresh`,
+  which validates the current token and issues a fresh one with the same identity. If refresh fails
+  (token expired >30 min), user is returned to the login screen.
+- **Tool calls:** All dashboard API calls use `POST /mcp/admin` (not `/mcp`). The `/mcp/admin` proxy
+  validates the dashboard session token (HS256, not Descope JWT), then dispatches to the actual
+  FastMCP tool function. This bypasses DescopeProvider which requires OAuth tokens.
+- **Data loading:** Each section loads data on first navigation. Dashboard home loads all metrics
+  in parallel via `Promise.all`. Tables display empty states when no data exists.
+- **Edit → Save:** JS calls the appropriate admin tool via `/mcp/admin`. Success shows a green
+  toast notification for 3 seconds and refreshes the relevant section. Errors display inline
+  next to the form field.
 
 ### Error States
 
 | Error | Behavior |
 |---|---|
-| Session token expired during edit | Save returns "invalid session" → JS redirects to Descope login. After re-auth, page reloads with fresh DB state. Unsaved edits are lost (acceptable — edits are small and quick; an auto-save draft would add complexity with no user benefit for a single-admin tool). |
-| Save failed (DB error, Mistral down) | Inline error message: "Save failed: ...". The editor stays open with the user's edits preserved in the textarea so they can try again. |
-| Dashboard JS fails to load (network error, 404) | User sees HTML fallback content served by the Starlette route: "Dashboard unavailable. Use AI chat to manage config." with a link to the connector in claude.ai. |
-| Non-admin visits `/admin` | Descope sign-in works (any user can authenticate), but after sign-in the page checks `role` from the session token. If role is not `"admin"`, the page displays "Access denied. Your account does not have admin permissions." No dashboard content is visible. |
-| Two admin browser tabs open | Last save wins. No conflict detection. This is a single-business-admin scenario — if there's one admin, there's no concurrent-edit race. If the business adds a second admin, the dashboard is still safe (last write wins, no corruption). |
+| Session token expired during edit | Save returns "invalid session" → dashboard auto-refreshes via `/admin/refresh` if possible, otherwise redirects to login. Unsaved edits are lost. |
+| Save failed (DB error, Mistral down) | Inline error message: "Save failed: ...". The form stays open with user's edits preserved. |
+| Dashboard JS fails to load | User sees a blank page. The login screen is rendered server-side via HTML. |
+| Invalid passphrase | `/admin/exchange` returns 401 → dashboard shows "Invalid passphrase." |
+| Two admin browser tabs open | Last save wins. No conflict detection. Single-admin scenario. |
 
 ### Technical Constraints
 
@@ -1251,8 +1429,92 @@ Same FastMCP tools ──── Same Neon DB ──── Same Descope auth
   no REST API layer, no GraphQL.
 - **Load time:** Under 2 seconds on first visit (one HTML file, one sign-in redirect, one
   `begin_session` call, one catalog fetch).
-- **Mobile:** Not optimized for mobile. The primary admin workflow is on a desktop browser.
-  The dashboard is still functional on mobile (text areas scroll), but not designed for it.
+- **Mobile:** First-class mobile support with responsive layout, touch-friendly controls, and
+  hamburger sidebar navigation. The admin dashboard must work on a 375px-wide phone screen
+  (iPhone SE) without horizontal scrolling, pinching, or zooming. All critical admin workflows —
+  checking ticket status, changing user roles, toggling a policy — must be one-thumb reachable.
+
+### Mobile Responsive Design (v2)
+
+The admin dashboard must be fully usable on a smartphone in situations where the admin is
+away from a desktop — on-call at 2am, in a meeting, or commuting. The AI chat interface
+works on mobile by nature (chat UI), but the dashboard's table layouts and sidebar nav are
+desktop-only in their current form. This creates a gap: admin needs quick dashboard access
+on mobile to change a user's role, flip a policy, or check ticket status without finding
+a laptop.
+
+#### Design Goals
+
+| Goal | Rationale |
+|------|-----------|
+| **375px minimum width** | iPhone SE (2016-2022), the narrowest modern smartphone |
+| **No horizontal scroll** | Every section fits within the viewport — tables scroll vertically only |
+| **Touch-friendly hit targets** | Buttons and links are at least 44x44px (Apple HIG / WCAG 2.1) |
+| **Hamburger navigation** | Sidebar collapses off-screen; tap hamburger icon to reveal overlay |
+| **Stacked layouts** | Multi-column grids become single-column; metric cards stack top-to-bottom |
+| **Readable tables** | No truncated columns — each row becomes a card, or columns reduce to essential fields |
+| **Form fields full-width** | Inputs and textareas use the full viewport width for easy thumb typing |
+| **Thumb-zone priorities** | Primary actions (Save, Refresh) are placed in the bottom half of the screen |
+| **Same single HTML file** | No separate mobile page, no redirect, no user-agent sniffing — pure CSS media queries |
+
+#### Breakpoints
+
+| Breakpoint | Target |
+|---|---|
+| `@media (max-width: 768px)` | Tablets and phones — trigger responsive layout |
+| `@media (max-width: 480px)` | Small phones — compact card layouts, minimal chrome |
+
+#### What Changes at Each Breakpoint
+
+**768px and below (tablet + phone):**
+- Sidebar: hidden by default; hamburger button (44x44px) appears in top-left corner. Tapping
+  opens a floating overlay sidebar with 280px width and semi-transparent backdrop. Tapping
+  backdrop or a nav link closes the sidebar.
+- Topbar: reduced height (50px), title font-size reduced, hamburger icon in top-left.
+- Metrics grid: `grid-template-columns: 1fr 1fr` (2 cards per row).
+- Overview panels: `grid-template-columns: 1fr` (stacked).
+- Content padding: reduced from 24px 28px to 16px.
+
+**480px and below (phone):**
+- Metrics grid: `grid-template-columns: 1fr` (full-width cards, stacked). Each metric
+  card becomes a horizontal row (label on left, value on right) to save vertical space.
+- Tables: each row becomes a card. Column headers become labels prefixing each value
+  in the card. Example: instead of `<tr><td>ID</td><td>Subject</td>...</tr>`, each row
+  renders as a card block with `<div class="ticket-card"><span class="label">ID</span><span>tkt-004</span> ...</div>`.
+  Essential fields only: Tickets table shows Subject + Status + Priority (ID hidden unless
+  single ticket view).
+- Panels: full-width with 8px border-radius (reduced from 10px).
+- Forms (Add Policy, Add Order): inputs stack vertically instead of horizontal form-row.
+- Buttons: full-width, 48px height for primary actions.
+- User management: role dropdown + Set button rendered inline, full-width.
+- Toast notifications: centered at top instead of bottom-right (thumb zone accessibility — bottom
+  on phone is hard to see when keyboard is open).
+
+#### No Change To
+
+- **Backend.** Zero server-side changes. All mobile adaptation is CSS + minimal JS.
+- **No new dependencies.** No CSS framework, no React Native, no PWA manifest. Pure CSS
+  media queries + one `onclick` handler for the hamburger toggle.
+- **Desktop behavior.** At widths above 768px the dashboard looks and behaves exactly as
+  it does today — no regression, no change in sidebar, tables, or layout.
+- **File structure.** Still a single `admin/index.html`. No separate mobile sprite, no
+  `mobile.html`, no build step.
+
+#### Acceptance Criteria (Mobile)
+
+- [ ] Dashboard loads on a 375px-wide viewport with no horizontal scrollbar
+- [ ] All 6 sidebar sections (Dashboard, Tickets, Rules, Users, Policies, Orders) navigable via hamburger menu
+- [ ] Hamburger icon visible and tappable (44x44px minimum); opens and closes with tap
+- [ ] Backdrop dismisses sidebar when tapped
+- [ ] Ticket table renders each ticket as a readable card on mobile (Subject + Status + Priority visible)
+- [ ] User Management table shows user ID, role badge, and Set button — all functional
+- [ ] Rules/Persona textareas use full viewport width and are editable with on-screen keyboard
+- [ ] Add Policy / Add Order forms stack vertically, all inputs full-width
+- [ ] Login screen is centered and usable on mobile (passphrase input + Sign In button)
+- [ ] Toast notifications appear at top-center on mobile, bottom-right on desktop
+- [ ] Desktop layout (768px+) is visually identical to current implementation
+- [ ] No horizontal scroll on any section at any supported width
+- [ ] Touch events work — no hover-dependent functionality breaks on mobile
 
 ### Comparison: AI Chat vs Dashboard
 
@@ -2131,25 +2393,23 @@ notification events never fire for User B's tickets. When a ticket status change
 - [ ] `in_progress` → `triaged` → rejected (use reopen flow)
 
 ### Admin Dashboard
-- [ ] Admin visits `/admin` → Descope login prompt → after sign-in → dashboard shows rules, persona, policy table
-- [ ] Non-admin visits `/admin` → Descope login prompt → after sign-in → "Access denied. Your account does not have admin permissions." shown
-- [ ] Staff (role `"staff"`) visits `/admin` → Descope login → "Access denied. Your account does not have admin permissions." — no dashboard content rendered
-- [ ] Rules textarea is pre-filled with current rules from DB (not empty, not stale)
-- [ ] Admin edits rules in textarea → clicks Save → green "Saved" toast → next `begin_session` returns updated rules
-- [ ] Persona textarea same flow: edit → Save → confirmation → next `begin_session` updated
-- [ ] Policy table lists all policies with ID, title, applies_to columns
-- [ ] Click policy row → row expands with inline editor showing title, body, applies_to in textareas
-- [ ] Edit policy body → Save → `catalog_set_policy` called → policy updated + re-embedded → row refreshes
-- [ ] Delete button on a policy → confirmation dialog ("Delete pol-003? This cannot be undone.") → on confirm → policy removed from table → `domain_get_policy("pol-003")` returns "not found"
-- [ ] "Add new policy" button → blank inline form → fill ID, title, body, applies_to → Save → new row appears in table
-- [ ] Order table toggle → collapsed by default → click to show → seed orders displayed with same CRUD
-- [ ] Session expires mid-edit → Save returns error → "Your session expired. Please sign in again." → redirects to Descope login
-- [ ] Save fails (DB error) → inline error message shown → editor stays open with edits preserved so admin can retry
-- [ ] Refresh browser → dashboard loads fresh DB state (not stale cache — verified by editing a policy via AI chat, then refreshing dashboard)
-- [ ] `/admin` served at correct URL on Fly.io (`https://support-desk.fly.dev/admin`)
-- [ ] Dashboard JS load failure → HTML fallback visible: "Dashboard unavailable. Use AI chat to manage config."
-- [ ] Dashboard load time < 2 seconds on first visit (Descope sign-in time excluded)
-- [ ] Two admin tabs open → both can save → last save wins → no corruption, no crash
+- [ ] Admin opens `/admin` → enters passphrase → dashboard loads with rules, persona, tickets, users, policies, orders
+- [ ] Invalid passphrase → "Invalid passphrase." error shown
+- [ ] Rules textarea pre-filled with current rules from DB
+- [ ] Admin edits rules → Save → green toast → next `begin_session` returns updated rules
+- [ ] Persona textarea same flow: edit → Save → confirmation
+- [ ] Tickets table lists all tickets with subject, priority (colored badge), status, category, date
+- [ ] User management table lists all users with role badges and inline role change dropdown
+- [ ] Policy table lists all policies with ID, title, applies_to. Add form creates new policy. Delete removes it.
+- [ ] Order table lists all orders with customer, total, status. Add form accepts JSON items array.
+- [ ] Dashboard home shows 5 metric cards + 4 overview panels (all clickable to navigate) + weekly summary
+- [ ] Token auto-refreshes every 25 minutes via `/admin/refresh`
+- [ ] Token stored in localStorage — survives browser refresh and restart
+- [ ] Token expires → returned to login screen → re-enters passphrase
+- [ ] Save fails (DB error) → inline error message → form stays open
+- [ ] Refresh browser → dashboard loads fresh DB state (not stale cache)
+- [ ] `/admin` served at correct URL (`https://tunnel/admin`)
+- [ ] Dashboard calls tools via `POST /mcp/admin` proxy (not `/mcp` — bypasses DescopeProvider)
 
 ### Background Sync (v3)
 - [ ] Gateway starts → background sync task begins without blocking server
@@ -2500,3 +2760,383 @@ fly ssh console
 ---
 
 *End of behavioral specification (v2 + v3).*
+
+---
+
+## Production Hardening — Integration Readiness
+
+These hardening items ensure all integrations work correctly in production with the
+free tier stack (Fly.io + Neon + Cloudflare R2 + SendGrid + Mistral + Descope) for
+up to 20 concurrent users. Each item addresses a specific gap between the demo-ready
+implementation and production reliability.
+
+### Shopify Credential Path (v3)
+
+**What:** `config_set_shopify_creds` writes tokens to the Neon `config` table, but
+`domain_get_order` reads only from `.env` environment variables. These two paths are
+disconnected — an admin can configure Shopify via the dashboard and the tool silently
+ignores it, using whatever is (or isn't) in `.env`.
+
+**Why:** In production, admins configure integrations through tools or the dashboard, not
+by SSH-ing into the server to edit files. The credential read path must honor the same
+source of truth. Freshdesk already does this correctly (`_fd_creds()` reads config table
+then env) — Shopify must match.
+
+**Behavior:**
+- `domain_get_order` reads Shopify creds from `config` table first (keys `shopify_access_token`, `shopify_store_domain`), falls back to `SHOPIFY_ACCESS_TOKEN` / `SHOPIFY_STORE_DOMAIN` env vars
+- Without config table creds and without env vars → returns `"Shopify not configured"`, not `"not found"`
+- `config_set_shopify_creds` takes effect immediately (no restart)
+
+**Acceptance:**
+- [ ] Admin calls `config_set_shopify_creds` via dashboard → status shows `configured`
+- [ ] `domain_get_order("ORD-NEW")` uses freshly configured token from config table
+- [ ] Without any creds → returns clear `"Shopify not configured"` error
+- [ ] Env var fallback still works when config table has no Shopify keys
+
+### Shopify API Version (v3)
+
+**What:** `domain_get_order` hardcodes Shopify REST Admin API version `2024-07`. Shopify
+deprecates REST API versions after ~12 months (quarterly releases). This version is past
+end-of-life.
+
+**Why:** Production integrations must not break on a vendor's deprecation schedule. The
+API version must be current and configurable without a code change.
+
+**Behavior:**
+- Bump from `2024-07` to `2025-04` (stable, supported as of 2026)
+- Make the version configurable via `SHOPIFY_API_VERSION` env var (default: `"2025-04"`)
+- Use version in all Shopify API URL construction
+
+**Acceptance:**
+- [ ] `domain_get_order` queries `admin/api/2025-04/orders/{id}.json`
+- [ ] Setting `SHOPIFY_API_VERSION=2025-07` in env uses that version
+- [ ] Unset → defaults to `2025-04`
+
+### Freshdesk Resilience (v3)
+
+**What:** The Freshdesk sync (both manual `domain_sync_to_freshdesk` and background
+`sync_loop`) silently swallows all HTTP errors with bare `except Exception: pass`.
+There is zero logging, zero retry, and no rate-limit protection. Sequential API calls
+can trigger Freshdesk's 50 req/min rate limit on the Sprout plan.
+
+**Why:** In production, transient network failures are expected and must not cause
+permanent sync desynchronization. Admins need visibility into sync failures so they
+can diagnose issues without database-level inspection.
+
+**Behavior:**
+- All Freshdesk HTTP calls: retry up to 3 times with exponential backoff (1s, 2s, 4s)
+- Log every retry and failure to stdout with timestamp, ticket ID, FD ID, and HTTP status
+- Insert 1-second `asyncio.sleep(1)` between batched ticket syncs in background loop
+- Sync errors on individual tickets do not block other tickets in the batch
+- Retry attempts are logged; final failure logs the ticket ID that couldn't sync
+
+**Acceptance:**
+- [ ] Freshdesk API unreachable → 3 retries attempted, all logged to stdout
+- [ ] 10 synced tickets in background loop → at least 9 seconds elapsed (1s gap per ticket)
+- [ ] One ticket's sync fails → remaining 9 still process
+- [ ] `fly logs` shows: `"Freshdesk sync tkt-010 → FD-1001: status unchanged"`
+- [ ] `fly logs` shows: `"Freshdesk sync tkt-010 → FD-1001 FAILED after 3 retries: HTTP 500"`
+
+### SendGrid Hardcoded Sender Removal (v2)
+
+**What:** `notifications.py` hardcodes `"shahabmalikAI5@gmail.com"` as the default
+`SENDGRID_SENDER_EMAIL`. This leaks a personal email into open-source code and makes
+the sender non-configurable for anyone who doesn't set the env var.
+
+**Why:** Production services must not have personal credentials in source code. The
+sender email must be explicitly configured by the deployer. The value is already in
+`.env` — the hardcoded fallback is unnecessary.
+
+**Behavior:**
+- Remove hardcoded default for `SENDGRID_SENDER_EMAIL`
+- If env var is missing → log warning `"SENDGRID_SENDER_EMAIL not set; email notifications disabled"`
+- `send_email()` returns `False` when sender email is unset (no crash, no API call attempted)
+- `SENDGRID_SENDER_NAME` default `"Support Desk"` remains (non-sensitive, reasonable default)
+
+**Acceptance:**
+- [ ] Repository contains zero personal email addresses in source code
+- [ ] SENDGRID_SENDER_EMAIL missing → `dispatch()` logs warning, no crash, no SendGrid call
+- [ ] SENDGRID_SENDER_EMAIL set → emails send from configured address as before
+
+### SendGrid Missing Dispatch Calls (v2)
+
+**What:** `reassign_ticket` and `submit_csat` do not call `notifications.dispatch()`,
+even though users can subscribe to `agent_assigned` and `resolution` events via
+`user_configure_notifications`. A user who configures email alerts for these events
+will never receive them — the subscription silently does nothing.
+
+**Why:** The notification system must honor the user's configured event subscriptions
+for all ticket lifecycle events, not just the two currently wired (status_changed from
+`update_ticket` and agent_assigned from `assign_ticket`).
+
+**Behavior:**
+- `reassign_ticket`: dispatch `agent_assigned` event to ticket creator after reassignment
+- `submit_csat`: dispatch `resolution` event to ticket creator after CSAT recorded
+- Both are fire-and-forget (failure logged to stdout, ticket operation proceeds regardless)
+
+**Acceptance:**
+- [ ] Agent reassigns ticket → creator with `agent_assigned` subscription receives email
+- [ ] Customer submits CSAT → creator with `resolution` subscription receives email
+- [ ] Notification dispatch fails (SendGrid down) → ticket reassignment/CSAT still succeed
+- [ ] User without notifications configured → no dispatch attempted, no error
+
+### R2 In-Memory Fallback Removal (v2)
+
+**What:** When R2 credentials are missing, `_store_file()` falls back to an in-memory
+`_ATTACHMENT_STORE` module-level dict. This dict does not survive server restarts or
+multiple worker processes, making all attachments permanently lost. The fallback is
+silent — admin has no indication files are stored in ephemeral memory.
+
+**Why:** Production file storage must either work or fail explicitly. Silent data loss
+on restart is unacceptable. The in-memory fallback was a development convenience that
+should never activate in production.
+
+**Behavior:**
+- Remove `_ATTACHMENT_STORE` dict and all in-memory code paths
+- When R2 credentials are missing → `domain_attach_file` returns explicit error:
+  `"Attachment storage not configured. Contact your administrator."`
+- Upload proceeds only when R2 creds are present and boto3 client initializes
+- `domain_get_attachment` always returns presigned URL from R2 (no inline base64 fallback)
+
+**Acceptance:**
+- [ ] R2 creds present → file uploads to R2, presigned URL returned in response
+- [ ] R2 creds missing → attach_file returns clear admin-actionable error
+- [ ] Server restart → previously uploaded (R2) attachments still accessible via presigned URL
+- [ ] No `_ATTACHMENT_STORE` variable exists in source code
+
+### Database Pool Tuning (v2)
+
+**What:** `db.py` creates a psycopg async pool with `max_size=4`, `min_size=1`, and
+no connection lifecycle settings (`max_lifetime`, `reconnect_timeout`). For 20 concurrent
+users making parallel MCP tool calls, 4 connections is a bottleneck. Neon serverless
+connections can silently time out without lifecycle management.
+
+**Why:** Under concurrent load, tool calls queue waiting for DB connections, causing MCP
+timeouts that surface as tool errors to end users. Long-lived idle connections to Neon's
+serverless proxy can be silently dropped, causing the next query on that connection to fail.
+
+**Behavior:**
+- Raise `max_size` from 4 → 10 (Neon free tier supports 10 simultaneous connections)
+- Add `max_lifetime=3600` (recycle connections every hour, preventing serverless timeouts)
+- Add `reconnect_timeout=10` (10 seconds to re-establish dropped connections)
+- Remove redundant `open=True` constructor flag (use explicit `await pool.open()` only)
+
+**Acceptance:**
+- [ ] Pool accepts up to 10 concurrent connections
+- [ ] Connections recycled after 1 hour (visible in Neon dashboard as new connection IDs)
+- [ ] Server starts without psycopg deprecation warning about `open=True`
+- [ ] `uv run python -c "from connector_app.db import pool; print(pool.max_size)"` → 10
+
+### Code Deduplication (v2)
+
+**What:** Two critical functions are duplicated across modules:
+- `_fd_creds()` — identically implemented in `sync.py:15-27` and `tools/domain.py:1048-1060`
+- `_get_embedding()` — identically implemented in `catalog.py:8-24` and `tools/domain.py:15-30`
+
+**Why:** Duplicate code diverges over time — a bug fix to one copy is inevitably missed in
+the other. The Freshdesk credential read must have exactly one implementation so both manual
+sync and background sync use identical logic including any future fixes.
+
+**Behavior:**
+- Extract `_fd_creds()` to a public function in `sync.py`, import in `tools/domain.py`
+- Extract `_get_embedding()` to a public function in `catalog.py`, import in `tools/domain.py`
+- Delete the duplicate copies in `tools/domain.py`
+- Update all internal call sites to use the imported versions
+
+**Acceptance:**
+- [ ] One `_fd_creds` implementation exists (in `sync.py`)
+- [ ] One `_get_embedding` implementation exists (in `catalog.py`)
+- [ ] All existing callers (`sync_loop`, `sync_to_freshdesk`, `set_policy`, `set_order`, `search`, `create_ticket`) work identically
+- [ ] `grep -rn "_fd_creds\|_get_embedding" src/` returns exactly one definition per function
+
+---
+
+## Production Deployment (Fly.io + Neon + Descope)
+
+### Deployment Architecture
+
+The gateway moves from a local Cloudflare tunnel to a permanent Fly.io VM with a fixed
+HTTPS URL. All other services (Neon, Descope, R2, SendGrid, Mistral) remain in their
+respective clouds with zero configuration changes except the Descope MCP Server URL.
+
+```
+claude.ai ──▶ Descope (OAuth 2.1 + DCR, free: 2,500 MAUs)
+                  │
+                  ▼
+            Fly.io VM (free: 256MB, 1 shared CPU, $5/mo credit)
+            support-desk.fly.dev:8080
+            FastMCP + Starlette + Docker
+                  │
+     ┌────────────┼────────────┐
+     ▼            ▼            ▼
+  Neon PG    Cloudflare R2   SendGrid
+ (3GB free)  (10GB free)   (100/day free)
+```
+
+**Why Fly.io:** Fixed URL (no changing tunnel hostname), no laptop dependency,
+~$2.15/mo within free $5/mo credit, Dockerfile already complete, health check at `/health`,
+one command deploy (`fly deploy`).
+
+### Step 1: Restart with Phase 15 Code
+
+The running server must restart to pick up production hardening (Phase 15: Shopify cred fix,
+Freshdesk retry, DB pool tuning, dedup). Local verification confirms all changes are live.
+
+**Behavior:**
+- `pkill -f "connector_app.server"` stops old process
+- `.venv/bin/python3 -m connector_app.server` starts fresh
+- `curl http://127.0.0.1:8000/health` → `{"status": "ok"}`
+- `uv run pytest tests/test_starter.py -q` → 8 passed
+
+**Acceptance:**
+- [ ] Server binds port 8000, health endpoint responds 200
+- [ ] All 8 offline smoke tests pass
+- [ ] No import errors (dedup functions resolve correctly)
+
+### Step 2: Fly.io Secrets
+
+All 21 environment variables from `.env` are set as Fly.io secrets (encrypted at rest,
+never echoed in logs). The only values that change from local: `BASE_URL` and `RESOURCE_URL`
+become `https://support-desk.fly.dev`.
+
+**Secrets to set:**
+```
+DATABASE_URL, DESCOPE_CONFIG_URL, BASE_URL, RESOURCE_URL,
+SESSION_SIGNING_SECRET, AUTH_DISABLED, DEV_SUB,
+MISTRAL_API_KEY, SENDGRID_API_KEY, SENDGRID_SENDER_EMAIL,
+R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_ENDPOINT, R2_BUCKET,
+FRESHDESK_API_KEY, FRESHDESK_DOMAIN,
+SHOPIFY_ACCESS_TOKEN, SHOPIFY_STORE_DOMAIN,
+ADMIN_DASHBOARD_SECRET, WEBHOOK_SECRET
+```
+
+**Behavior:**
+- `fly secrets set KEY=VALUE` for each env var
+- Run individually (21 commands) or batch via `fly secrets import`
+- `BASE_URL` and `RESOURCE_URL` both set to `https://support-desk.fly.dev`
+- Portal server binding: `host="0.0.0.0"`, `port=int(os.environ.get("PORT", "8000"))` (already in code)
+
+**Acceptance:**
+- [ ] `fly secrets list` shows all 21 keys (values redacted)
+- [ ] No `.env` file on the VM (secrets are the only config source)
+
+### Step 3: Fly Deploy
+
+**Behavior:**
+- `fly deploy` builds the Docker image (python:3.14-slim + uv), pushes to registry, launches VM
+- Health check: `GET /health` every 15s with 5s timeout
+- Force HTTPS, 1 machine minimum, auto-start and auto-restart
+- Server binds `0.0.0.0:8080` (Fly sets `PORT=8080`)
+
+**Dockerfile and fly.toml are already complete** — no code changes needed for deployment.
+
+**Acceptance:**
+- [ ] `fly status` shows 1 machine in state "started"
+- [ ] `curl https://support-desk.fly.dev/health` → `{"status": "ok"}`
+- [ ] `curl https://support-desk.fly.dev/mcp` (no auth) → HTTP 401
+- [ ] `curl https://support-desk.fly.dev/.well-known/oauth-protected-resource/mcp` → correct resource + authorization_servers
+- [ ] `curl https://support-desk.fly.dev/admin` → 200 (dashboard loads)
+
+### Step 4: Seed Neon Database
+
+The `seed/` JSON files exist but are not loaded into the database. These must be inserted
+into the live Neon DB so that the application has test data for verification.
+
+**Tables to seed:**
+
+| Table | Source | Records |
+|---|---|---|
+| `users` | derived from `seed/tickets.json` | 4 users: dev-user-001, user-alice-42, user-marcus-55, user-priya-88 |
+| `tickets` | `seed/tickets.json` | 5 tickets: tkt-010 (open), tkt-011 (triaged), tkt-012 (in_progress), tkt-013 (pending), tkt-014 (resolved) |
+| `attachments` | `seed/attachments.json` | 2 attachments for tkt-014 |
+| `notification_config` | `seed/notifications.json` | 1 config for dev-user-001 |
+| `user_state` | runtime default | `{}` for each of 4 users |
+| `config` | runtime default | `rules` and `persona` from config_store fallbacks |
+| `config_history` | runtime default | `version_index=0` for rules + persona |
+| `ticket_notes` | runtime default | system_event for tkt-011 assignment |
+
+**Behavior:**
+- Insert users with `id` = OAuth sub (e.g., `dev-user-001`), `role` = admin (for dev-user-001)
+- Insert tickets with all v2/v3 fields: `assigned_to`, `csat_score`, `freshdesk_id`
+- Insert attachments with `r2_key` references
+- Insert notification_config with `user_sub` = `dev-user-001`
+- Insert user_state with empty `{}` JSONB
+- Insert config rows for `rules` and `persona` with fallback values
+- Insert config_history with `version_index=0` for both keys
+- Insert ticket_notes for tkt-011 assignment
+
+All operations are idempotent — use `INSERT ... ON CONFLICT DO NOTHING`.
+
+**Acceptance:**
+- [ ] `SELECT count(*) FROM tickets` → 5 (tkt-010 through tkt-014)
+- [ ] `SELECT count(*) FROM users` → 4+ (includes dev-user-001)
+- [ ] `SELECT count(*) FROM attachments` → 2
+- [ ] `SELECT count(*) FROM notification_config` → 1
+- [ ] `SELECT state FROM user_state WHERE user_id = 'dev-user-001'` → `{}`
+- [ ] `SELECT value FROM config WHERE key = 'rules'` → non-empty string
+- [ ] `domain_get_ticket("tkt-014")` → returns ticket with `attachment_count: 2`, `csat_score: 4`
+
+### Step 5: Descope Console Update
+
+Update the Descope MCP Server to point to the permanent Fly.io URL instead of the
+ephemeral Cloudflare tunnel.
+
+| Setting | Old | New |
+|---|---|---|
+| MCP Server URL | `https://significance-although-...trycloudflare.com/mcp` | `https://support-desk.fly.dev/mcp` |
+| App URL | `https://significance-although-...trycloudflare.com` | `https://support-desk.fly.dev` |
+| Approved Domains | `trycloudflare.com` | add `fly.dev` |
+| DCR | (verify ON) | ON |
+
+**Behavior:**
+- Admin opens Descope console → navigates to MCP Servers → edits server configuration
+- Sets MCP Server URL to `https://support-desk.fly.dev/mcp`
+- Sets App URL to `https://support-desk.fly.dev`
+- Adds `fly.dev` to Approved Domains (keep `trycloudflare.com` for local dev)
+- Verifies DCR toggle is ON
+- Saves configuration
+
+**Acceptance:**
+- [ ] Descope well-known endpoint responds 200
+- [ ] Fly.io well-known endpoint shows correct `authorization_servers`
+- [ ] MCP Server URL field in Descope shows `support-desk.fly.dev/mcp`
+
+### Step 6: End-to-End Verification
+
+Full integration test from the public URL after deployment and seeding.
+
+**Verification checklist:**
+
+| # | Test | Expected |
+|---|---|---|
+| 1 | `curl /health` | 200 `{"status": "ok"}` |
+| 2 | No auth → `POST /mcp tools/list` | 401 with `WWW-Authenticate` header |
+| 3 | `GET /.well-known/oauth-protected-resource/mcp` | `resource: "support-desk.fly.dev/mcp"`, `authorization_servers` points to Descope |
+| 4 | Valid Descope JWT → `begin_session` | Returns `session_token`, `rules`, `persona`, `state`, `role` |
+| 5 | `domain_get_ticket("tkt-014")` | Resolved ticket with `csat_score: 4`, `attachment_count: 2`, `attachment_ids: ["att-001", "att-002"]` |
+| 6 | `domain_create_ticket` with `category: "technical"` | Ticket created, `category` field stored correctly |
+| 7 | `domain_search("refund")` | Returns pol-001 (refund policy) with cosine similarity score |
+| 8 | `domain_get_customer_profile` | Includes `total_tickets`, `open_tickets`, `csat_trend`, `sla_breaches` |
+| 9 | `domain_submit_csat` on non-resolved ticket | Rejected: `"ticket must be resolved before rating"` |
+| 10 | `domain_submit_csat("tkt-014", 5)` | Returns `already_rated: true` (tkt-014 already has csat_score=4) |
+| 11 | `domain_get_customer_profile` after CSAT | `csat_trend` field present and computed |
+| 12 | `domain_agent_performance` by non-admin (staff/customer) | Returns `"not found"` (admin-only tool) |
+| 13 | `domain_attach_file` valid PNG | Returns `attachment_id`, links to ticket |
+| 14 | `domain_get_attachment` valid ID | Returns `presigned_url` with `url_expires_at` (15-min expiry) |
+| 15 | `domain_get_attachment` wrong owner | Returns `"not found"` (multi-tenant check) |
+| 16 | `domain_list_my_tickets` | Returns list filtered to current user's `sub` |
+| 17 | `domain_get_audit_log` | Returns `entries` array with `total_matching`, `returned` |
+| 18 | `domain_draft_reply("tkt-012")` | Returns structured context: policy_excerpt, customer_history, agent_name |
+| 19 | `user_save_state({"key": "v"})` → `user_get_profile` | Round-trips: saved state appears in profile |
+| 20 | New chat, same user, `begin_session` | Previous state restored from `user_state` (cross-chat memory) |
+| 21 | `domain_get_order("non-existent-order")` with Shopify creds | Falls back to Shopify API, returns `source: "shopify"` or `"Shopify not configured"` |
+| 22 | R2 creds missing → `domain_attach_file` | Returns `"Attachment storage not configured. Contact your administrator."` |
+| 23 | Admin calls `domain_report_summary("week")` | Returns `tickets_created`, `tickets_resolved`, `sla_breaches`, `avg_csat_score`, `top_categories`, `by_priority`, `from`, `to` |
+| 24 | Dashboard at `/admin` | Passphrase login works, all 6 sections load data, mobile hamburger nav works |
+| 25 | Cross-chat memory (new chat, same Descope user) | State persists across separate chat sessions |
+
+**Acceptance:**
+- [ ] All 25 tests pass
+- [ ] Zero crashes, zero 500 errors, zero silent failures
+- [ ] `fly logs` shows clean output (no unexpected exceptions)
+- [ ] All Phase 15 hardening is active (Freshdesk retry logged, no hardcoded email, dedup active)

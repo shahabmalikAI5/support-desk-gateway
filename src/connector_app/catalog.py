@@ -5,7 +5,7 @@ import os
 from psycopg.types.json import Jsonb
 
 
-async def _get_embedding(text: str) -> list[float] | None:
+async def get_embedding(text: str) -> list[float] | None:
     api_key = os.environ.get("MISTRAL_API_KEY")
     if not api_key:
         return None
@@ -49,7 +49,7 @@ async def set_policy(pool, sub: str, role: str, policy_id: str, title: str, body
     try:
         content = {"title": title.strip(), "body": body.strip(), "applies_to": applies_to.strip()}
         text = _item_text("policy", content)
-        embedding = await _get_embedding(text) if text else None
+        embedding = await get_embedding(text) if text else None
         embedding_regenerated = embedding is not None
 
         async with pool.connection() as conn:
@@ -98,7 +98,7 @@ async def set_order(pool, sub: str, role: str, order_id: str, content: dict, rem
         return {"error": "content must be a JSON object", "_reminder": reminder}
     try:
         text = _item_text("order", content)
-        embedding = await _get_embedding(text) if text else None
+        embedding = await get_embedding(text) if text else None
         embedding_regenerated = embedding is not None
 
         async with pool.connection() as conn:
@@ -180,13 +180,13 @@ async def list_all(pool, sub: str, role: str, entity_type: str | None, reminder:
 
                 if entity_type:
                     await cur.execute(
-                        "SELECT id, entity_type, content, updated_at FROM support_embeddings "
+                        "SELECT id, entity_type, content FROM support_embeddings "
                         "WHERE entity_type = %s ORDER BY id LIMIT %s OFFSET %s",
                         (entity_type, actual_limit, offset),
                     )
                 else:
                     await cur.execute(
-                        "SELECT id, entity_type, content, updated_at FROM support_embeddings "
+                        "SELECT id, entity_type, content FROM support_embeddings "
                         "ORDER BY entity_type, id LIMIT %s OFFSET %s",
                         (actual_limit, offset),
                     )
@@ -201,7 +201,6 @@ async def list_all(pool, sub: str, role: str, entity_type: str | None, reminder:
                 item["applies_to"] = c.get("applies_to")
             else:
                 item["content"] = c
-            item["updated_at"] = r[3].isoformat() if r[3] else None
             items.append(item)
 
         return {"items": items, "total": total, "returned": len(items), "offset": offset, "_reminder": reminder}

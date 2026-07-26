@@ -11,8 +11,9 @@ async def get_pool() -> AsyncConnectionPool:
         _pool = AsyncConnectionPool(
             conninfo=os.environ["DATABASE_URL"],
             min_size=1,
-            max_size=4,
-            open=True,
+            max_size=10,
+            max_lifetime=3600,
+            reconnect_timeout=10,
         )
         await _pool.open()
         await _pool.wait()
