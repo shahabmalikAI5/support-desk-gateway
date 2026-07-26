@@ -591,6 +591,22 @@ async def _admin_page(request):
     return FileResponse(str(_ADMIN_HTML))
 
 
+# ── Root landing page ────────────────────────────────────────────────────────
+
+async def _root_page(request):
+    return JSONResponse({
+        "service": "Support Desk Gateway",
+        "version": "v2/v3",
+        "endpoints": {
+            "mcp": "/mcp",
+            "admin": "/admin",
+            "health": "/health",
+            "well_known": "/.well-known/oauth-protected-resource/mcp"
+        },
+        "docs": "https://github.com/shahabmalikAI5/support-desk-gateway"
+    })
+
+
 # ── Health endpoint ──────────────────────────────────────────────────────────
 
 async def _health_endpoint(request):
@@ -714,6 +730,7 @@ _routes: list = []
 if not _auth_disabled and _auth_provider is not None:
     _routes.extend(_auth_provider.get_well_known_routes(mcp_path="/mcp"))
 
+_routes.append(Route("/", endpoint=_root_page))
 _routes.append(Route("/health", endpoint=_health_endpoint, methods=["GET"]))
 _routes.append(Route("/admin", endpoint=_admin_page))
 _routes.append(Route("/admin/refresh", endpoint=_token_refresh, methods=["POST"]))
