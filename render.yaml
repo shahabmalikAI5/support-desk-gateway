@@ -1,0 +1,56 @@
+services:
+  - type: web
+    name: support-desk
+    runtime: docker
+    repo: https://github.com/shahabmalikAI5/support-desk-gateway
+    branch: main
+    plan: free
+    region: oregon
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: "8080"
+      - key: DATABASE_URL
+        sync: false
+      - key: DESCOPE_CONFIG_URL
+        sync: false
+      - key: BASE_URL
+        sync: false
+      - key: RESOURCE_URL
+        sync: false
+      - key: AUTH_ISSUER
+        sync: false
+      - key: AUTH_JWKS_URL
+        sync: false
+      - key: SESSION_SIGNING_SECRET
+        sync: false
+      - key: AUTH_DISABLED
+        value: "0"
+      - key: DEV_SUB
+        value: "dev-user-001"
+      - key: MISTRAL_API_KEY
+        sync: false
+      - key: SENDGRID_API_KEY
+        sync: false
+      - key: SENDGRID_SENDER_EMAIL
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+      - key: R2_ENDPOINT
+        sync: false
+      - key: R2_BUCKET
+        value: "support-desk-attachments"
+      - key: FRESHDESK_API_KEY
+        sync: false
+      - key: FRESHDESK_DOMAIN
+        sync: false
+      - key: SHOPIFY_ACCESS_TOKEN
+        sync: false
+      - key: SHOPIFY_STORE_DOMAIN
+        sync: false
+      - key: ADMIN_DASHBOARD_SECRET
+        sync: false
+      - key: WEBHOOK_SECRET
+        sync: false
