@@ -29,9 +29,9 @@ from jose.exceptions import JWTError
 type JWKSDoc = dict[str, Any]  # the authorization server's published key set
 type Claims = dict[str, Any]  # a validated token payload; claims["sub"] is the user
 
-AUTH_ISSUER: str = os.environ["AUTH_ISSUER"]  # e.g. https://auth.myapp.com
-AUTH_JWKS_URL: str = os.environ["AUTH_JWKS_URL"]  # e.g. https://auth.myapp.com/jwks.json
-RESOURCE_URL: str = os.environ["RESOURCE_URL"]  # THIS server's canonical URL — the audience
+AUTH_ISSUER: str = os.environ.get("AUTH_ISSUER", "")
+AUTH_JWKS_URL: str = os.environ.get("AUTH_JWKS_URL", "")
+RESOURCE_URL: str = os.environ.get("RESOURCE_URL", os.environ.get("BASE_URL", ""))
 
 
 class AuthError(Exception):

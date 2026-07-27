@@ -11,7 +11,8 @@ load_dotenv(override=False)
 
 import uvicorn
 from fastmcp import FastMCP
-from fastmcp.server.auth.providers.descope import DescopeProvider
+from fastmcp.server.auth import OAuthProxy
+from fastmcp.server.auth.providers.jwt import JWTVerifier
 from starlette.applications import Starlette
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
@@ -30,15 +31,35 @@ from connector_app import role_gate
 _REMINDER = "Present every result in the support agent's professional voice — be helpful, precise, and escalate when uncertain."
 
 _auth_disabled = os.environ.get("AUTH_DISABLED", "0") == "1"
+_auth_provider = None
+
+_AUTH_PROVIDER_SWITCH = os.environ.get("AUTH_PROVIDER", "clerk").lower()
 
 if _auth_disabled:
     mcp = FastMCP("Support Desk")
-else:
+elif _AUTH_PROVIDER_SWITCH == "descope":
+    from fastmcp.server.auth.providers.descope import DescopeProvider
     _auth_provider = DescopeProvider(
         config_url=os.environ["DESCOPE_CONFIG_URL"],
         base_url=os.environ.get("BASE_URL", "http://localhost:8000"),
         required_scopes=[],
         scopes_supported=["mcp:read", "mcp:write", "admin", "staff"],
+    )
+    mcp = FastMCP("Support Desk", auth=_auth_provider)
+else:
+    _token_verifier = JWTVerifier(
+        jwks_uri=f"{os.environ['CLERK_ISSUER_URL']}/.well-known/jwks.json",
+        issuer=os.environ["CLERK_ISSUER_URL"],
+        audience=os.environ["CLERK_CLIENT_ID"],
+        required_claims=["sub", "exp"],
+    )
+    _auth_provider = OAuthProxy(
+        issuer_url=os.environ["CLERK_ISSUER_URL"],
+        client_id=os.environ["CLERK_CLIENT_ID"],
+        client_secret=os.environ["CLERK_CLIENT_SECRET"],
+        token_verifier=_token_verifier,
+        base_url=os.environ.get("BASE_URL", "http://localhost:8000"),
+        scopes_supported=["openid", "profile", "email", "mcp:read", "mcp:write"],
     )
     mcp = FastMCP("Support Desk", auth=_auth_provider)
 
