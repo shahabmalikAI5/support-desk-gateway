@@ -7,18 +7,19 @@ v1 is complete. **All v2 and v3 features are now implemented** (39 tools, 11 DB 
 - v4 autonomous agent loop (out of scope)
 - Mobile-responsive admin dashboard (v2 — Phase 14, **DONE**)
 - Production hardening (v2/v3 — Phase 15, **DONE**)
-- Production deployment + seed + verify (v2/v3 — Phase 16, **in progress**)
+- Production deployment + seed + verify (v2/v3 — Phase 16, **DONE** — deployed to Render at `https://support-desk-vcjt.onrender.com`)
 
 Key architectural changes made during implementation:
+- **Auth provider**: Migrated from DescopeProvider to **OAuthProxy + Clerk** (2026-07-27).
+  OAuthProxy presents DCR to claude.ai, proxies auth to Clerk (Google/Email sign-in), and issues
+  FastMCP-signed JWTs. Descope path preserved via `AUTH_PROVIDER=descope` env switch.
 - **Role source**: moved from Descope JWT claims to `users.role` DB column (Descope JWT role claims
   proved unreliable). `begin_session` does `SELECT role FROM users WHERE id = $sub`.
 - **tools/list filtering**: removed the ASGI-level wrapper. All 39 tools visible in `tools/list`.
   Role enforcement at tool level via `role_gate.py` (returns `"not found"` for unauthorized callers).
-  DescopeProvider's `scopes_supported=["mcp:read","mcp:write","admin","staff"]` helps claude.ai
-  expose all tools.
-- **Dashboard auth**: shared passphrase (`ADMIN_DASHBOARD_SECRET` from `.env`) instead of Descope
-  OAuth in browser. Dashboard calls tools via `POST /mcp/admin` proxy (validates HS256 session
-  token, bypasses DescopeProvider). Token auto-refreshes every 25 min via `/admin/refresh`.
+- **Dashboard auth**: shared passphrase (`ADMIN_DASHBOARD_SECRET` from `.env`) instead of OAuth
+  in browser. Dashboard calls tools via `POST /mcp/admin` proxy (validates HS256 session
+  token, bypasses OAuthProxy). Token auto-refreshes every 25 min via `/admin/refresh`.
   Login via `/admin/exchange` (passphrase → token). One-time dashboard code system via
   `admin_get_dashboard_token` → `admin_codes` table as alternate path.
 - **Admin tools**: `admin_list_users`, `admin_set_user_role`, `admin_get_dashboard_token`,
@@ -33,7 +34,7 @@ Key architectural changes made during implementation:
 | Layer | Choice | Rationale |
 |-------|--------|-----------|
 | Framework | FastMCP + Starlette | Unchanged from v1 |
-| Auth | DescopeProvider + session.py | Unchanged; role claim already implemented |
+| Auth | **OAuthProxy + Clerk** (was DescopeProvider) | Migrated 2026-07-27. OAuthProxy presents DCR to claude.ai, proxies to Clerk. DescopeProvider preserved via `AUTH_PROVIDER=descope` env switch. |
 | DB | Neon PostgreSQL + psycopg async | Unchanged; 6 tables exist, `ticket_notes` needs creation |
 | Embeddings | Mistral API + httpx | Unchanged |
 | Attachments | Cloudflare R2 via **boto3** | Installed; R2 client needs wiring into domain.py |
@@ -41,7 +42,7 @@ Key architectural changes made during implementation:
 | External APIs | Raw httpx (Freshdesk, Shopify) | domain_sync_to_freshdesk needs real implementation |
 | Admin dashboard | Single static HTML file | admin/index.html exists; route path needs hardening |
 | Background sync | asyncio Task | sync.py exists; scope and credential reading need fixes |
-| Deployment | Dockerfile + fly.toml | **Missing** — must be created |
+| Deployment | **Render** `render.yaml` + Dockerfile | Deployed at `https://support-desk-vcjt.onrender.com` |
 
 ---
 
@@ -73,7 +74,7 @@ seed/
 ├── notifications.json   # 1 notification config row
 └── articles.json        # 3 concept articles (superseded)
 Dockerfile               # Deploy container (python:3.14-slim)
-fly.toml                 # Fly.io config (support-desk app)
+render.yaml              # Render web service config (deployed at support-desk-vcjt.onrender.com)
 ```
 
 ---
@@ -243,7 +244,7 @@ Rewrite from current:
   body excerpt (first 300 chars).
 - Fetch customer history: count of previous tickets, avg CSAT
 - **Note:** The codebase stores only `created_by` (an opaque `sub` string), not a display name.
-  There is no Descope profile lookup. Return `created_by` as `customer_name` (it will be the
+  There is no OAuth profile lookup. Return `created_by` as `customer_name` (it will be the
   OAuth sub). The AI model may resolve it to a name if it has context from the conversation.
 - Return structured:
   ```json
@@ -652,20 +653,20 @@ no Descope console config needed.
 
 **Verification:** `uv run pytest -q` — 8 offline tests pass. Server starts, `/health` returns 200. 39 tools listed.
 
-### Phase 16: Production Deployment (6 steps) — NOT STARTED
+### Phase 16: Production Deployment (6 steps) — DONE
 
 | Step | What | Files / Tools |
 |------|------|---------------|
 | 16.1 | **Restart server:** Kill old process, start fresh to pick up Phase 15 code. Verify health + 8 tests pass. | shell |
-| 16.2 | **Fly.io secrets:** Set all 21 env vars via `fly secrets set`. `BASE_URL`/`RESOURCE_URL` → `support-desk.fly.dev`. | fly CLI |
-| 16.3 | **Fly deploy:** `fly deploy` builds Docker image, launches VM. Verify health, well-known, MCP, admin dashboard respond. | fly CLI |
+| 16.2 | **Render env vars:** Set all env vars via Render dashboard. `BASE_URL` → `support-desk-vcjt.onrender.com`. | Render dashboard |
+| 16.3 | **Render deploy:** Docker build on push to `main` branch. Verify health, well-known, MCP, admin dashboard respond. | Render |
 | 16.4 | **Seed Neon DB:** Insert users (4), tickets (5), attachments (2), notification_config (1), user_state (4), config (2), config_history (2), ticket_notes (1). Idempotent `INSERT ... ON CONFLICT DO NOTHING`. | Neon SQL |
-| 16.5 | **Update Descope:** MCP Server URL → `support-desk.fly.dev/mcp`, App URL → `support-desk.fly.dev`, Approved Domains add `fly.dev`, DCR ON. | Descope console |
+| 16.5 | **Configure Clerk OAuth app:** Redirect URI → `support-desk-vcjt.onrender.com/auth/callback`, scopes → `openid profile email`. Client ID + secret stored in Render env vars. | Clerk dashboard |
 | 16.6 | **End-to-end verification:** 25 tests covering auth, tickets, CSAT, search, attachments, multi-tenant, cross-chat memory, dashboard, Freshdesk sync, Shopify lookup, notifications. | curl + claude.ai |
 
-**Implementation approach:** Steps 16.1 (restart) and 16.2-16.3 (fly deploy) can run in parallel since they target different environments. Steps 16.4-16.6 are sequential dependencies (seed → verify). Dockerfile and fly.toml are already complete — zero code changes for deploy. All secrets already in `.env`.
+**Implementation approach:** Steps 16.1 (restart) and 16.2-16.3 (Render deploy) can run in parallel since they target different environments. Steps 16.4-16.6 are sequential dependencies (seed → verify). Dockerfile and render.yaml are already complete — zero code changes for deploy. All secrets already in `.env`.
 
-**Verification:** 25-point checklist. All Phase 15 hardening active. Fly.io machine healthy. Descope auth works end-to-end. Cross-chat memory persists.
+**Verification:** 25-point checklist. All Phase 15 hardening active. Render service healthy. Clerk auth works end-to-end. Cross-chat memory persists.
 
 ---
 
@@ -688,8 +689,8 @@ All 39 tools are returned by `tools/list` to all authenticated users. Role enfor
 tool level via `role_gate.py` — unauthorized callers receive `"not found"`. This is simpler,
 more reliable, and fails closed (tools return `"not found"` for unauthorized callers).
 
-The DescopeProvider's `scopes_supported=["mcp:read","mcp:write","admin","staff"]` configuration
-helps claude.ai's MCP client expose all tools to the model.
+The OAuthProxy's `valid_scopes=["openid","profile","email"]` configuration advertises available
+scopes to claude.ai's MCP client.
 
 ### 5.4 Freshdesk Status Mapping (spec lines 1331–1347)
 

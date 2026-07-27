@@ -21,11 +21,11 @@ User B can never read User A's tickets — not even by guessing the ID — and p
 becomes searchable (by its owner only).
 
 No agent loop (that's v4). No web-based admin UI. Instead, admin tools within the MCP connector
-(role-gated via Descope metadata) let business admins update rules, persona, policies, and catalog
+(role-gated via `users.role` DB column) let business admins update rules, persona, policies, and catalog
 items through the same AI chat interface — no SQL, no deploy, no developer needed. For bulk
 editing and side-by-side review, a single-page admin dashboard served at `/admin` from the same
-Fly.io application provides the same functionality with a web form interface, gated by the same
-Descope sign-in and role check. No multi-language support. All existing v1 tools and invariants
+Render web service provides the same functionality with a web form interface, gated by a shared
+passphrase (`ADMIN_DASHBOARD_SECRET`). No multi-language support. All existing v1 tools and invariants
 remain untouched.
 
 ---
@@ -146,8 +146,8 @@ down causes `domain_get_order` to crash (it should fall back gracefully).
 ### v2 Scenario 9: Business admin updates policy without a developer
 
 > The refund window changes from 30 to 60 days. Sarah (business admin) opens her AI assistant
-> (same connector, same tools — but Sarah has `role: "admin"` in her Descope profile, set by
-> the business owner in the Descope Dashboard). She says: *"Update our refund policy: change
+> (same connector, same tools — but Sarah has `role: "admin"` in her database record, set by
+> the business owner via the admin dashboard). She says: *"Update our refund policy: change
 > the return window from 30 days to 60 days. No restocking fee for any returns under $100. The
 > rest stays the same."*
 
@@ -183,9 +183,9 @@ her admin role wasn't recognized from Descope. Or the update succeeds but subseq
 
 > Sarah needs to update 6 policies at once after a compliance review. The AI chat interface is
 > great for one-off changes but slow for bulk work — updating 6 policies would take 6 separate
-> chat exchanges. She opens her browser and navigates to `https://support-desk.fly.dev/admin`.
-> The page shows a Descope sign-in prompt (same provider as the MCP connector). After sign-in,
-> the dashboard recognizes Sarah's `role: "admin"` from her Descope profile and loads all
+> chat exchanges. She opens her browser and navigates to `https://support-desk-vcjt.onrender.com/admin`.
+> The page shows a passphrase login prompt. After entering the shared secret,
+> the dashboard recognizes Sarah's `role: "admin"` from her database role and loads all
 > policies in a table. Each row shows the policy ID, title, applies_to, and last-updated
 > timestamp. Sarah clicks the first row — it expands into an inline editor with textareas for
 > title, body, and applies_to. She pastes the updated compliance text, clicks Save, and sees a
@@ -296,13 +296,13 @@ can call `admin_set_user_role` and elevate their own role.
 ## Access Control (Role Gating)
 
 The support desk has three roles, managed through the `users.role` column in the database.
-The role is NOT extracted from the Descope JWT — only `sub` (identity) comes from the verified
+Role is NOT extracted from the OAuth JWT — only `sub` (identity) comes from the verified
 OAuth token. The role is looked up from `users.role` during `begin_session` and embedded in the
 session token (HMAC-signed — tampering invalidates the token). Admin users can manage roles via
 `admin_list_users` / `admin_set_user_role` tools or the admin dashboard at `/admin`.
 
 ```
-Descope JWT → verified by DescopeProvider → sub extracted
+OAuth Proxy (Clerk) → verified by OAuthProxy/JWTVerifier → sub extracted
                           │
                           ▼
 begin_session() → SELECT role FROM users WHERE id = sub
@@ -403,19 +403,12 @@ Calls `admin_list_users` and `admin_set_user_role` — no SQL, no console.
 3. Click "Refresh" under User Management
 4. Use the role dropdown to set admin/staff/customer
 5. Click "Set" — change takes effect on user's next `begin_session`
-7. The user's next `begin_session` call picks up the new role.
 
-**Removing a role:** Delete the `role` key from User Metadata, or set value to an empty string.
-Next `begin_session` → `role: null` → customer-tier access.
+**Removing a role:** Set role to `customer` in dashboard or via `admin_set_user_role`. This sets
+`users.role = NULL` in DB. Next `begin_session` → `role: null` → customer-tier access.
 
-**Setting up the custom claim in Descope (one-time):**
-1. Navigate to **Authorization** → **JWT Templates** → select the access token template.
-2. Under **Custom Claims**, add a claim with name `role`, source type **User Metadata**,
-   metadata key `role`. The claim is now included in every access token issued by Descope.
-3. If your Descope plan does not support custom claims, the connector must fall back to the
-   Descope Management API: `begin_session` calls `GET /v1/mgmt/user/{sub}` with a Management
-   API key (stored as Fly secret `DESCOPE_MANAGEMENT_API_KEY`) to fetch the user's metadata
-   and extract `role`. This adds ~50ms latency to `begin_session`.
+**First admin setup:** Set `DEV_ROLE=admin` in Render env vars. The first user who connects gets
+`role = "admin"` on their initial `begin_session`. They can then manage roles for subsequent users.
 
 ---
 
@@ -1143,7 +1136,7 @@ created so the restore itself is versioned.
 #### `config_set_freshdesk_creds`
 
 **What it does:** Sets or updates Freshdesk integration credentials at runtime. Overrides the
-Fly secret defaults. The background sync task and `domain_sync_to_freshdesk` use these
+Render env var defaults. The background sync task and `domain_sync_to_freshdesk` use these
 credentials.
 
 **Input:**
@@ -1179,7 +1172,7 @@ credentials.
 #### `config_set_shopify_creds`
 
 **What it does:** Sets or updates Shopify integration credentials at runtime. Overrides the
-Fly secret defaults. `domain_get_order` uses these credentials for live order lookup.
+Render env var defaults. `domain_get_order` uses these credentials for live order lookup.
 
 **Input:**
 - `access_token` (string, required): Shopify Admin API access token.
@@ -1198,7 +1191,7 @@ Fly secret defaults. `domain_get_order` uses these credentials for live order lo
 - UPSERTs into config store under `shopify_access_token` and `shopify_store_domain`.
 - Takes effect immediately — next `domain_get_order` call uses the new credentials.
 - Pass empty string to clear: `access_token=""` → removes the token (falls back to Fly secret).
-- If neither Fly secret nor runtime credentials exist, Shopify lookup is skipped entirely
+- If neither Render env var nor runtime credentials exist, Shopify lookup is skipped entirely
   (local catalog only, no error).
 - Audit logged (token value is never included in the log — logged as `"token=****"`).
 
@@ -1402,7 +1395,7 @@ Same FastMCP tool implementations ──── Same Neon DB
   (token expired >30 min), user is returned to the login screen.
 - **Tool calls:** All dashboard API calls use `POST /mcp/admin` (not `/mcp`). The `/mcp/admin` proxy
   validates the dashboard session token (HS256, not Descope JWT), then dispatches to the actual
-  FastMCP tool function. This bypasses DescopeProvider which requires OAuth tokens.
+  FastMCP tool function. This bypasses OAuthProxy which requires OAuth tokens.
 - **Data loading:** Each section loads data on first navigation. Dashboard home loads all metrics
   in parallel via `Promise.all`. Tables display empty states when no data exists.
 - **Edit → Save:** JS calls the appropriate admin tool via `/mcp/admin`. Success shows a green
@@ -1597,7 +1590,7 @@ store, not hardcoded).
 | `body` | `description` | Full body text |
 | `status` | `status` | Mapped: open→2, triaged→2, in_progress→3, pending→3, resolved→4, closed→5 |
 | `priority` | `priority` | Mapped: critical→4, high→3, medium→2, low→1 |
-| `created_by` | `email` | Looked up from the user's Descope profile OR a `guest_email` field on the ticket. If unavailable, defaults to a configurable fallback email |
+| `created_by` | `email` | Looked up from the user's OAuth profile OR a `guest_email` field on the ticket. If unavailable, defaults to a configurable fallback email |
 
 **Freshdesk field mapping (Freshdesk → local, on pull/sync_bi):**
 
@@ -1680,10 +1673,10 @@ current config.
 
 #### `begin_session` (v3 — role extraction)
 
-`begin_session` now extracts the caller's role from the Descope JWT claims (via `auth.py`
-returning the full verified claims dictionary, not just `sub`). The role is read from the
-JWT claim `role` (set via Descope Dashboard → User Metadata → `{ "role": "admin" }` or
-`{ "role": "staff" }`). Customers have no `role` claim — the field is null.
+`begin_session` extracts the caller's role from the `users.role` database column (read during
+session creation, NOT from the OAuth JWT). The role is looked up via `SELECT role FROM users
+WHERE id = $sub`. If the user has never been seen, they are created with `role = NULL` and
+the `DEV_ROLE` env var provides a fallback. The role is embedded in the session token.
 
 **Output change:** A new field `role` is added to the `begin_session` return:
 ```json
@@ -1886,7 +1879,7 @@ in totals but excluded from the top-5 ranking.
 ### Notification Details
 
 **Email (SendGrid):** Emails are sent via the SendGrid API (free tier: 100 emails/day).
-The SendGrid API key is stored as a Fly secret (`SENDGRID_API_KEY`). Email sending is
+The SendGrid API key is stored as a Render env var (`SENDGRID_API_KEY`). Email sending is
 synchronous within the tool call that triggers it. On failure (SendGrid down, rate limit,
 invalid email), the failure is logged but does NOT block the ticket status change. The
 tool returns normally — notification delivery is best-effort.
@@ -1906,7 +1899,7 @@ using WEBHOOK_SECRET as the key>`. The consumer verifies the signature with the 
 Webhook delivery is fire-and-forget — a failed POST is logged but not retried. The ticket
 status change proceeds regardless.
 
-**WEBHOOK_SECRET** is stored as a Fly secret.
+**WEBHOOK_SECRET** is stored as a Render env var.
 
 ### Freshdesk Sync Bootstrap
 
@@ -2128,15 +2121,15 @@ notification events never fire for User B's tickets. When a ticket status change
   non-admin callers — identical to calling a tool that doesn't exist.
 - Admin tools are excluded from MCP `tools/list` for non-admin sessions. The AI model cannot
   discover them, so it cannot hallucinate a call to an admin-only tool for a non-admin user.
-- `begin_session` extracts the role from the Descope JWT claim `role`. If the Descope user
-  has no `role` metadata, `role` is `null` in the session token — every admin tool rejects with
-  `"not found"`.
-- Changing a user's role in Descope Dashboard takes effect on their next `begin_session` call.
+- `begin_session` reads the role from `users.role` database column. On first login, new users
+  get `role = NULL` (customer), overridden by `DEV_ROLE` env var if set. Admins promote users
+  via `admin_set_user_role` tool or admin dashboard.
+- Changing a user's role takes effect on their next `begin_session` call.
   Active sessions with the old role remain valid until their session token expires (30 min).
 - Session token tampering: if a session token's `role` claim is modified, the HMAC signature
   becomes invalid and `require_session` rejects the token — the token cannot pass as admin.
 - A session token minted for an admin user is valid for 30 minutes. If the admin's role is
-  revoked in Descope during that window, the existing session token continues to grant admin
+  revoked in the database during that window, the existing session token continues to grant admin
   access until expiry. This is an accepted trade-off: role changes are not real-time, they take
   effect on the next `begin_session`.
 
@@ -2470,9 +2463,14 @@ account numbers, or government ID data — only support-related content.
 
 ---
 
-## Deployment to Fly.io (Cloud, Free Tier)
+## Deployment to Render (Cloud, Free Tier)
 
-The gateway currently runs on your machine behind a Cloudflare tunnel. Fly.io moves the compute
+> **Note (2026-07-27):** The gateway is deployed on **Render** at `https://support-desk-vcjt.onrender.com`,
+> not Fly.io as originally planned. Auth uses **OAuthProxy + Clerk** instead of Descope. The sections
+> below describe the deployment architecture and verification checklist — URLs and provider names
+> updated where stale, but the core architecture (Docker, Neon, PostgreSQL, background sync) is unchanged.
+
+The gateway currently runs on your machine behind a Cloudflare tunnel. Render moves the compute
 to a free-tier cloud VM with a fixed HTTPS URL — no tunnel, no laptop dependency, no URL changes
 on restart. Neon and Descope remain in their respective clouds with zero changes.
 
