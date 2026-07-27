@@ -50,7 +50,6 @@ else:
     _token_verifier = JWTVerifier(
         jwks_uri=f"{os.environ['CLERK_ISSUER_URL']}/.well-known/jwks.json",
         issuer=os.environ["CLERK_ISSUER_URL"],
-        audience=os.environ["CLERK_CLIENT_ID"],
     )
     _auth_provider = OAuthProxy(
         upstream_authorization_endpoint=f"{os.environ['CLERK_ISSUER_URL']}/oauth/authorize",
