@@ -59,7 +59,7 @@ else:
         upstream_client_secret=os.environ["CLERK_CLIENT_SECRET"],
         token_verifier=_token_verifier,
         base_url=os.environ.get("BASE_URL", "http://localhost:8000"),
-        scopes_supported=["openid", "profile", "email", "mcp:read", "mcp:write"],
+        valid_scopes=["openid", "profile", "email", "mcp:read", "mcp:write"],
     )
     mcp = FastMCP("Support Desk", auth=_auth_provider)
 
