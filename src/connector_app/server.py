@@ -51,7 +51,6 @@ else:
         jwks_uri=f"{os.environ['CLERK_ISSUER_URL']}/.well-known/jwks.json",
         issuer=os.environ["CLERK_ISSUER_URL"],
         audience=os.environ["CLERK_CLIENT_ID"],
-        required_claims=["sub", "exp"],
     )
     _auth_provider = OAuthProxy(
         issuer_url=os.environ["CLERK_ISSUER_URL"],
