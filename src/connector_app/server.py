@@ -53,9 +53,10 @@ else:
         audience=os.environ["CLERK_CLIENT_ID"],
     )
     _auth_provider = OAuthProxy(
-        issuer_url=os.environ["CLERK_ISSUER_URL"],
-        client_id=os.environ["CLERK_CLIENT_ID"],
-        client_secret=os.environ["CLERK_CLIENT_SECRET"],
+        upstream_authorization_endpoint=f"{os.environ['CLERK_ISSUER_URL']}/oauth/authorize",
+        upstream_token_endpoint=f"{os.environ['CLERK_ISSUER_URL']}/oauth/token",
+        upstream_client_id=os.environ["CLERK_CLIENT_ID"],
+        upstream_client_secret=os.environ["CLERK_CLIENT_SECRET"],
         token_verifier=_token_verifier,
         base_url=os.environ.get("BASE_URL", "http://localhost:8000"),
         scopes_supported=["openid", "profile", "email", "mcp:read", "mcp:write"],
