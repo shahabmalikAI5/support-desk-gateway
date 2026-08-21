@@ -13,6 +13,8 @@ import uvicorn
 from fastmcp import FastMCP
 from fastmcp.server.auth import OAuthProxy
 from fastmcp.server.auth.providers.jwt import JWTVerifier
+from key_value.aio.stores.postgresql import PostgreSQLStore
+from key_value.aio.wrappers.encryption import FernetEncryptionWrapper
 from starlette.applications import Starlette
 from starlette.responses import FileResponse, JSONResponse
 from starlette.routing import Mount, Route
@@ -51,6 +53,17 @@ else:
         jwks_uri=f"{os.environ['CLERK_ISSUER_URL']}/.well-known/jwks.json",
         issuer=os.environ["CLERK_ISSUER_URL"],
     )
+    _oauth_storage = PostgreSQLStore(
+        url=os.environ["DATABASE_URL"],
+        table_name="oauth_proxy_state",
+        auto_create=True,
+    )
+    _oauth_storage = FernetEncryptionWrapper(
+        key_value=_oauth_storage,
+        source_material=os.environ["SESSION_SIGNING_SECRET"],
+        salt="connector-app-oauth-storage",
+        raise_on_decryption_error=False,
+    )
     _auth_provider = OAuthProxy(
         upstream_authorization_endpoint=f"{os.environ['CLERK_ISSUER_URL']}/oauth/authorize",
         upstream_token_endpoint=f"{os.environ['CLERK_ISSUER_URL']}/oauth/token",
@@ -60,6 +73,7 @@ else:
         base_url=os.environ.get("BASE_URL", "http://localhost:8000"),
         valid_scopes=["openid", "profile", "email"],
         require_authorization_consent="external",
+        client_storage=_oauth_storage,
     )
     mcp = FastMCP("Support Desk", auth=_auth_provider)
 
