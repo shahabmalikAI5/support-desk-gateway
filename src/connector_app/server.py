@@ -59,6 +59,7 @@ else:
         token_verifier=_token_verifier,
         base_url=os.environ.get("BASE_URL", "http://localhost:8000"),
         valid_scopes=["openid", "profile", "email"],
+        require_authorization_consent="external",
     )
     mcp = FastMCP("Support Desk", auth=_auth_provider)
 
